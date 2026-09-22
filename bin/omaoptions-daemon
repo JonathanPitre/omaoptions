@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""omaoptions-daemon — headless Solaar engine for the OmaOptions Omarchy plugin.
+
+Runs Solaar's receiver listener (the same code the Solaar GUI uses) without
+any window or tray icon, as a user service:
+
+  * applies the persisted Solaar settings (~/.config/solaar/config.yaml) to a
+    device when it connects — DPI, wheel mode, SmartShift, thumb-wheel and
+    key diversion, keyboard fn-swap / layout / backlight
+  * evaluates ~/.config/solaar/rules.yaml: mouse gestures on the diverted
+    gesture button, diverted keys/buttons, thumb-wheel events → Execute /
+    KeyPress / MouseScroll / MouseClick
+  * writes battery / connection state to ~/.config/omarchy/omaoptions/status.json
+    (from notifications plus a slow poll) and the devices' remappable keys to
+    devices.json, so the bar never has to open the receiver itself
+
+It talks to the Bolt receiver and to Bluetooth devices the way Solaar does,
+which — unlike logiops 0.3.x — actually works on this hardware.
+"""
+
+import json
+import logging
+import os
+import signal
+import sys
+import time
+import warnings
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".config", "omarchy", "omaoptions")
+STATUS_PATH = os.path.join(STATE_DIR, "status.json")
+DEVICES_PATH = os.path.join(STATE_DIR, "devices.json")
+PENDING_PATH = os.path.join(STATE_DIR, "pending.json")
+BATTERY_POLL_SEC = 300
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+for noisy in ("logitech_receiver.base", "logitech_receiver.hidpp20", "logitech_receiver.device", "logitech_receiver.receiver",
+              "logitech_receiver.settings", "logitech_receiver.notifications", "solaar.listener", "solaar.configuration"):
+    logging.getLogger(noisy).setLevel(logging.ERROR)
+log = logging.getLogger("omaoptions")
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+# Solaar's KeyPress action maps keysyms through the GDK keymap, which only
+# exists once GDK has opened the display — do that before importing Solaar.
+if not Gtk.init_check()[0]:
+    log.warning("no display: simulated key presses will not work until the session is up")
+
+from solaar import configuration, listener  # noqa: E402
+
+try:
+    from solaar import dbus as solaar_dbus
+except Exception:  # pragma: no cover - optional
+    solaar_dbus = None
+
+try:
+    from logitech_receiver.hidpp20 import KeyFlag
+except Exception:  # pragma: no cover
+    KeyFlag = None
+
+# path -> Device (devices only, never receivers)
+_devices = {}
+_keys_recorded = set()
+_last_online = {}   # serial/name -> time.time() when last seen online
+_last_battery = {}  # serial/name -> (level, charging, full)
+
+
+def _atomic_write(path, payload):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _link(device):
+    if getattr(device, "receiver", None):
+        return "receiver"
+    if getattr(device, "bluetooth", False):
+        return "bluetooth"
+    return "usb"
+
+
+def _battery_fields(device):
+    info = getattr(device, "battery_info", None)
+    if info is None:
+        return None, None, None
+    level = info.level
+    try:
+        level = int(level) if level is not None else None
+    except (TypeError, ValueError):
+        level = None
+    st = str(info.status).lower() if info.status is not None else ""
+    charging = ("recharg" in st) or ("almost_full" in st)
+    full = st.endswith(".full")
+    return level, charging, full
+
+
+def _snapshot():
+    devices = []
+    for path, d in list(_devices.items()):
+        try:
+            key = str(getattr(d, "serial", "") or d.name)
+            level, charging, full = _battery_fields(d)
+            if d.online:
+                _last_online[key] = time.time()
+                if level is not None:
+                    _last_battery[key] = (level, charging, full)
+            elif level is None and key in _last_battery:
+                level, charging, full = _last_battery[key]
+            devices.append({
+                "name": str(d.name or ""),
+                "kind": str(d.kind or ""),
+                "link": _link(d),
+                "online": bool(d.online),
+                "battery": level,
+                "charging": bool(charging),
+                "full": bool(full),
+                "serial": str(getattr(d, "serial", "") or ""),
+                "lastOnline": _last_online.get(key),
+            })
+        except Exception as ex:  # a device object mid-teardown
+            log.debug("snapshot skipped %s: %s", path, ex)
+    return devices
+
+
+def write_status():
+    devices = _snapshot()
+    if not devices and os.path.exists(STATUS_PATH):
+        return  # keep the last known list until devices attach after a restart
+    _atomic_write(STATUS_PATH, {"at": time.time(), "devices": devices})
+
+
+def record_keys(device):
+    key = str(getattr(device, "serial", "") or device.name)
+    if key in _keys_recorded or not device.online:
+        return
+    keys = []
+    try:
+        ks = device.keys
+        for i in range(len(ks) if ks is not None else 0):
+            k = ks[i]
+            if k is None:
+                continue
+            flags = k.flags
+            if flags is None or KeyFlag is None:
+                divertable = True
+            else:
+                try:
+                    divertable = KeyFlag.DIVERTABLE in flags
+                except TypeError:
+                    divertable = bool(int(getattr(flags, "value", flags)) & 0x20)
+            keys.append({"name": str(k.key), "cid": int(k.key), "divertable": bool(divertable)})
+    except Exception as ex:
+        log.warning("could not read keys of %s: %s", device.name, ex)
+        return
+    _keys_recorded.add(key)
+    settings = []
+    try:
+        settings = sorted({str(st.name) for st in (device.settings or [])})
+    except Exception as ex:
+        log.warning("could not read settings of %s: %s", device.name, ex)
+    try:
+        existing = json.load(open(DEVICES_PATH)).get("devices", [])
+    except Exception:
+        existing = []
+    existing = [e for e in existing if e.get("name") != str(device.name)]
+    existing.append({"name": str(device.name), "kind": str(device.kind or ""), "link": _link(device),
+                     "serial": str(getattr(device, "serial", "") or ""), "online": True,
+                     "keys": keys, "settings": settings})
+    _atomic_write(DEVICES_PATH, {"at": time.time(), "devices": existing})
+    log.info("%s: %d remappable keys recorded", device.name, sum(1 for k in keys if k["divertable"]))
+
+
+def apply_pending(device):
+    """Settings `omaoptions apply` could not write because the device was
+    offline are queued in pending.json; write them now that it is online."""
+    try:
+        pending = json.load(open(PENDING_PATH))
+    except Exception:
+        return
+    mine = [j for j in pending if j.get("device", "").lower() == str(device.name).lower()]
+    if not mine or not device.online:
+        return
+    try:
+        from solaar.cli import config as cli_config
+    except Exception as ex:
+        log.warning("cannot apply pending settings: %s", ex)
+        return
+    done = []
+    for job in mine:
+        try:
+            setting = next((s for s in device.settings if s.name == job["setting"]), None)
+            if setting is None:
+                log.warning("%s: no setting %s", device.name, job["setting"])
+                done.append(job)
+                continue
+            vals = [str(v) for v in job.get("values", [])]
+
+            class _Args:
+                pass
+            a = _Args()
+            a.value_key = vals[0] if vals else None
+            a.extra_subkey = vals[1] if len(vals) > 1 else None
+            a.extra2 = vals[2] if len(vals) > 2 else None
+            result, message, value = cli_config.set(device, setting, a, True)
+            log.info("%s: %s", device.name, message or f"{job['setting']}={vals}")
+            done.append(job)
+        except Exception as ex:
+            log.warning("%s: pending %s failed: %s", device.name, job.get("setting"), ex)
+    remaining = [j for j in pending if j not in done]
+    _atomic_write(PENDING_PATH, remaining)
+    try:
+        configuration.save()
+    except Exception:
+        pass
+
+
+def status_changed(device, alert=None, reason=None, refresh=False):
+    try:
+        if device.kind is None:  # a receiver
+            return
+        if not bool(device):  # unpaired / gone
+            _devices.pop(getattr(device, "path", None), None)
+        else:
+            _devices[getattr(device, "path", None) or str(device.serial)] = device
+            if device.online:
+                GLib.idle_add(record_keys, device)
+                GLib.timeout_add(1500, lambda d=device: (apply_pending(d), False)[1])
+        write_status()
+    except Exception as ex:
+        log.warning("status_changed failed: %s", ex)
+
+
+def setting_changed(device, setting_class, vals):
+    pass
+
+
+def error_cb(reason, path):
+    log.error("Solaar error %s on %s", reason, path)
+
+
+def poll_battery():
+    for d in list(_devices.values()):
+        try:
+            if d.online:
+                b = d.battery()
+                if b is not None:
+                    d.set_battery_info(b)
+        except Exception as ex:
+            log.debug("battery poll %s: %s", d, ex)
+    write_status()
+    return True
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    configuration.defer_saves = True
+    listener.setup_scanner(status_changed, setting_changed, error_cb)
+    if solaar_dbus is not None:
+        try:
+            solaar_dbus.watch_suspend_resume(listener.start_all, listener.stop_all)
+        except Exception as ex:
+            log.info("suspend/resume watch unavailable: %s", ex)
+    loop = GLib.MainLoop()
+
+    def shutdown(*_):
+        log.info("stopping")
+        try:
+            listener.stop_all()
+            configuration.save()
+        finally:
+            loop.quit()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, shutdown)
+
+    listener.start_all()
+    GLib.timeout_add_seconds(BATTERY_POLL_SEC, poll_battery)
+    GLib.timeout_add_seconds(20, lambda: (poll_battery(), False)[1])  # one early refresh after start
+    write_status()
+    log.info("OmaOptions engine running (Solaar %s)", getattr(__import__("solaar"), "__version__", "?"))
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

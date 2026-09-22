@@ -1,0 +1,1116 @@
+#!/usr/bin/env python3
+"""omaoptions — Logi Options-style configuration for Logitech devices on Omarchy.
+
+Backend for the `andreinita21.omaoptions` omarchy-shell plugin. Every
+Logitech mouse or keyboard Solaar can talk to (Bolt, Unifying, Bluetooth,
+USB) is discovered live by the engine (bin/omaoptions-daemon); this script
+turns ~/.config/omarchy/omaoptions/config.json into Solaar state:
+
+  * device settings written through Solaar and persisted in
+    ~/.config/solaar/config.yaml — DPI, wheel mode, SmartShift, thumb wheel,
+    which buttons/keys are diverted, keyboard fn-swap / OS layout / backlight
+  * ~/.config/solaar/rules.yaml — what happens on gestures, diverted keys and
+    thumb-wheel events (Execute / KeyPress / MouseScroll / MouseClick)
+  * ~/.config/hypr/omaoptions.lua — per-device vertical scroll factor
+
+Slots (what can be remapped) and settings (what can be tuned) are derived
+from what each device reports, so the panel only shows what exists.
+
+Subcommands:
+  get        devices + config + action catalog as JSON (for the panel)
+  apply      write settings + rules, restart the engine   [--json '<config>']
+  status     connection / battery / service state as JSON
+  discover   list devices, their remappable keys and settings
+  native     run a built-in action for a device (toggle-smartshift, cycle-dpi, …)
+  doctor     human-readable diagnostics dump
+  defaults   print the built-in defaults
+"""
+
+import argparse
+import contextlib
+import copy
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONF_DIR = os.path.join(HOME, ".config", "omarchy", "omaoptions")
+CONFIG_PATH = os.path.join(CONF_DIR, "config.json")
+STATE_PATH = os.path.join(CONF_DIR, "state.json")
+STATUS_PATH = os.path.join(CONF_DIR, "status.json")
+DEVICES_PATH = os.path.join(CONF_DIR, "devices.json")
+PENDING_PATH = os.path.join(CONF_DIR, "pending.json")
+ACTIONS_PATH = os.path.join(PLUGIN_DIR, "actions.json")
+SOLAAR_DIR = os.path.join(HOME, ".config", "solaar")
+RULES_PATH = os.path.join(SOLAAR_DIR, "rules.yaml")
+HYPR_LUA = os.path.join(HOME, ".config", "hypr", "omaoptions.lua")
+HYPR_MAIN = os.path.join(HOME, ".config", "hypr", "hyprland.lua")
+SERVICE = "omaoptions.service"
+CLI_PATH = os.path.realpath(__file__)
+
+CONFIG_VERSION = 4
+
+# --------------------------------------------------------------------------
+# Defaults
+# --------------------------------------------------------------------------
+
+# Settings every device starts with; only the ones the device actually
+# exposes (see devices.json "settings") are written.
+GENERIC_SETTINGS = {
+    "mouse": {
+        "dpi": 1000,
+        "smartshiftOn": True,
+        "smartshift": 10,              # Solaar smart-shift 1…50, higher = harder to free-spin
+        "hires": True,                 # hi-res (smooth) wheel
+        "invertWheel": False,
+        "verticalScroll": 0.15,        # Hyprland per-device scroll_factor; null = global
+        "horizontalThreshold": 0,      # 0 = native thumb wheel; N = emulated, one step per N units
+        "invertThumb": False,
+        "dpiPresets": [800, 1000, 1600, 2400],
+    },
+    "keyboard": {
+        "topRow": "media",             # fkeys | media | unchanged
+        "layout": "unchanged",         # unchanged | Linux | MacOS | iOS | Chrome | Windows | Android
+        "backlightMode": "Automatic",  # unchanged | Automatic | Manual | Disabled
+        "backlightLevel": 2,
+        "fadeHandsOut": None,
+        "fadeHandsIn": None,
+        "fadePowered": None,
+    },
+}
+
+# Default slot actions by slot id. Key slots are addressed by control id so
+# they carry over between models: key.0x108 is "Emoji" on every MX keyboard.
+GENERIC_SLOTS = {
+    "mouse": {
+        "gesture.tap": "omarchy-menu",
+        "gesture.up": "launcher",
+        "gesture.down": "scratchpad",
+        "gesture.left": "workspace-prev-new",
+        "gesture.right": "workspace-next-new",
+        "thumb.left": "workspace-prev-new",
+        "thumb.right": "workspace-next-new",
+    },
+    "keyboard": {
+        "key.0x108": "emoji",          # Emoji
+        "key.0x10a": "screenshot",     # Screen Capture
+        "key.0x11c": "mic-mute",       # Mute Microphone
+    },
+}
+
+# Per-model overrides of the generic defaults (kept in sync with the author's setup).
+MODEL_DEFAULTS = {
+    "MX Keys Mini": {
+        "settings": {
+            "backlightLevel": 98,
+            "backlightMode": "Automatic",
+            "fadeHandsIn": None,
+            "fadeHandsOut": None,
+            "fadePowered": None,
+            "layout": "unchanged",
+            "topRow": "media"
+        },
+        "slots": {
+            "key.0x103": "default",
+            "key.0x108": "emoji",
+            "key.0x10a": "screenshot",
+            "key.0x117": "default",
+            "key.0x11c": "mic-mute",
+            "key.0x11d": "default",
+            "key.0xc2": "default",
+            "key.0xe0": "default",
+            "key.0xe1": "default",
+            "key.0xe2": "default",
+            "key.0xe3": "default",
+            "key.0xe5": "default",
+            "key.0xe7": "default",
+            "key.0xe8": "default",
+            "key.0xe9": "default"
+        }
+    },
+    "MX Master 3S": {
+        "settings": {
+            "dpi": 1000,
+            "dpiPresets": [
+                800,
+                1000,
+                1600,
+                2400
+            ],
+            "hires": True,
+            "horizontalThreshold": 32,
+            "invertThumb": False,
+            "invertWheel": False,
+            "smartshift": 10,
+            "smartshiftOn": True,
+            "verticalScroll": 0.15
+        },
+        "slots": {
+            "gesture.down": "scratchpad",
+            "gesture.left": "workspace-prev-new",
+            "gesture.right": "workspace-next-new",
+            "gesture.tap": "omarchy-menu",
+            "gesture.up": "launcher",
+            "key.0x52": "default",
+            "key.0x53": "default",
+            "key.0x56": "default",
+            "key.0xc4": "default",
+            "thumb.left": "workspace-prev-new",
+            "thumb.right": "workspace-next-new"
+        }
+    }
+}
+
+# Hyprland input-device names a Logitech mouse can appear under. Receiver
+# mice all share the receiver's name; Bluetooth ones use the slugged model name.
+def hypr_device_names(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return ["logitech-usb-receiver-mouse", "logitech-usb-receiver-mouse-1", slug, slug + "-mouse"]
+
+
+# Friendlier labels for known control ids: (model prefix, cid) -> label. The
+# generic label is the firmware name. MX Keys Mini keycaps verified by hand.
+KEY_LABELS = {
+    ("MX Keys Mini", 0xE2): "F4 · Backlight down",
+    ("MX Keys Mini", 0xE3): "F5 · Backlight up",
+    ("MX Keys Mini", 0x103): "F6 · Dictation",
+    ("MX Keys Mini", 0x108): "F7 · Emoji",
+    ("MX Keys Mini", 0x10A): "F8 · Screen capture",
+    ("MX Keys Mini", 0x11C): "F9 · Mic mute",
+    ("MX Keys Mini", 0xE5): "F10 · Play / pause",
+    ("MX Keys Mini", 0xE7): "Mute",
+    ("MX Keys Mini", 0xE8): "F11 · Volume down",
+    ("MX Keys Mini", 0xE9): "F12 · Volume up",
+    ("*", 0x52): "Wheel click",
+    ("*", 0x53): "Back button",
+    ("*", 0x56): "Forward button",
+    ("*", 0xC4): "Mode shift (top button)",
+    ("*", 0xD7): "Virtual gesture button",
+}
+# Controls that must never be diverted (the mouse would become unusable) or
+# that are handled elsewhere (gesture button).
+SKIP_CIDS = {0x50, 0x51, 0xC3, 0xD7}  # 0xD7 'Virtual Gesture Button' is not a real diversion target
+GESTURE_CID = 0xC3
+
+GESTURE_SLOTS = [
+    ("gesture.tap", "Tap (press & release)", []),
+    ("gesture.up", "Hold + move up", ["Mouse Up"]),
+    ("gesture.down", "Hold + move down", ["Mouse Down"]),
+    ("gesture.left", "Hold + move left", ["Mouse Left"]),
+    ("gesture.right", "Hold + move right", ["Mouse Right"]),
+]
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+
+def load_actions():
+    with open(ACTIONS_PATH) as f:
+        data = json.load(f)
+    return {a["id"]: a for a in data["actions"]}, data["actions"]
+
+
+def deep_merge(base, override):
+    out = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def save_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def load_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default if default is not None else {}
+
+
+def load_state():
+    return load_json(STATE_PATH, {})
+
+
+def save_state(state):
+    save_json(STATE_PATH, state)
+
+
+def run(cmd, timeout=20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{' '.join(cmd)}: timed out after {timeout}s"
+    return p.returncode, p.stdout, p.stderr
+
+
+def have(binary):
+    return shutil.which(binary) is not None
+
+
+def norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+@contextlib.contextmanager
+def solaar_lock(timeout=45):
+    """Only one CLI-side HID++ conversation at a time."""
+    os.makedirs(CONF_DIR, exist_ok=True)
+    fd = os.open(os.path.join(CONF_DIR, ".hidpp.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.time() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > deadline:
+                    raise TimeoutError("another omaoptions process is talking to the receiver")
+                time.sleep(0.2)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def lock_busy():
+    path = os.path.join(CONF_DIR, ".hidpp.lock")
+    if not os.path.exists(path):
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+
+def migrate(cfg):
+    """Upgrade configs written by earlier (single mouse + keyboard) versions."""
+    if cfg.get("version", 0) >= CONFIG_VERSION and "devices" in cfg:
+        return cfg
+    out = {"version": CONFIG_VERSION, "devices": {}}
+    m = cfg.get("mouse")
+    if isinstance(m, dict) and m.get("name"):
+        ss, hs, sc, th = m.get("smartshift", {}), m.get("hiresscroll", {}), m.get("scroll", {}), m.get("thumb", {})
+        settings = {}
+        if "dpi" in m: settings["dpi"] = m["dpi"]
+        if "on" in ss: settings["smartshiftOn"] = ss["on"]
+        if "threshold" in ss: settings["smartshift"] = min(50, int(ss["threshold"]))
+        if "hires" in hs: settings["hires"] = hs["hires"]
+        if "invert" in hs: settings["invertWheel"] = hs["invert"]
+        if "vertical" in sc: settings["verticalScroll"] = sc["vertical"]
+        if "horizontalThreshold" in sc: settings["horizontalThreshold"] = sc["horizontalThreshold"]
+        if "invert" in th: settings["invertThumb"] = th["invert"]
+        if "dpiPresets" in m: settings["dpiPresets"] = m["dpiPresets"]
+        slots = {}
+        for k, v in (m.get("gesture") or {}).items():
+            if k != "threshold": slots["gesture." + k] = v
+        for k in ("left", "right"):
+            if k in th: slots["thumb." + k] = th[k]
+        for k, cid in (("back", 0x53), ("forward", 0x56), ("middle", 0x52), ("modeshift", 0xC4)):
+            if k in (m.get("button") or {}): slots[f"key.0x{cid:x}"] = m["button"][k]
+        custom = {k.replace("mouse.", "", 1).replace("button.", "key.", 1): v for k, v in (cfg.get("custom") or {}).items() if k.startswith("mouse.")}
+        out["devices"][m["name"]] = {"settings": settings, "slots": slots, "custom": custom}
+        if m.get("hyprDevices"): out["devices"][m["name"]]["hyprDevices"] = m["hyprDevices"]
+    k = cfg.get("keyboard")
+    if isinstance(k, dict) and k.get("name"):
+        bl = k.get("backlight") or {}
+        settings = {}
+        for src, dst in (("topRow", "topRow"), ("layout", "layout")):
+            if src in k: settings[dst] = k[src]
+        for src, dst in (("mode", "backlightMode"), ("level", "backlightLevel"), ("fadeHandsOut", "fadeHandsOut"),
+                         ("fadeHandsIn", "fadeHandsIn"), ("fadePowered", "fadePowered")):
+            if src in bl: settings[dst] = bl[src]
+        cids = {"backlightdown": 0xE2, "backlightup": 0xE3, "dictation": 0x103, "emoji": 0x108, "micmute": 0x11C,
+                "screenshot": 0x10A, "playpause": 0xE5, "mute": 0xE7, "volumedown": 0xE8, "volumeup": 0xE9,
+                "delete": 0x117, "missioncontrol": 0xE0, "launchpad": 0xE1, "lock": 0xC2, "dnd": 0x11D}
+        slots = {f"key.0x{cids[n]:x}": v for n, v in (k.get("key") or {}).items() if n in cids}
+        custom = {}
+        for kk, v in (cfg.get("custom") or {}).items():
+            if kk.startswith("keyboard.key."):
+                n = kk.split(".")[-1]
+                if n in cids: custom[f"key.0x{cids[n]:x}"] = v
+        out["devices"][k["name"]] = {"settings": settings, "slots": slots, "custom": custom}
+    return out
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            user = json.load(f)
+    except FileNotFoundError:
+        user = {}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"{CONFIG_PATH}: invalid JSON: {e}")
+    cfg = migrate(user)
+    cfg.setdefault("version", CONFIG_VERSION)
+    cfg.setdefault("devices", {})
+    return cfg
+
+
+def save_config(cfg):
+    save_json(CONFIG_PATH, cfg)
+
+
+def device_kind_group(kind):
+    k = (kind or "").lower()
+    if k in ("keyboard", "numpad"):
+        return "keyboard"
+    return "mouse"
+
+
+def merged_device(cfg, name, kind):
+    """Generic defaults <- model defaults <- user config for one device."""
+    group = device_kind_group(kind)
+    base = {"settings": copy.deepcopy(GENERIC_SETTINGS[group]), "slots": copy.deepcopy(GENERIC_SLOTS[group]), "custom": {}}
+    base = deep_merge(base, MODEL_DEFAULTS.get(name, {}))
+    base = deep_merge(base, (cfg.get("devices") or {}).get(name, {}))
+    if group == "mouse" and not base.get("hyprDevices"):
+        base["hyprDevices"] = hypr_device_names(name)
+    return base
+
+
+# --------------------------------------------------------------------------
+# Discovery -> slots
+# --------------------------------------------------------------------------
+
+
+def discovered_devices():
+    return [d for d in load_json(DEVICES_PATH, {}).get("devices", []) if d.get("name")]
+
+
+def key_label(model, name, cid):
+    for key in ((model, cid), ("*", cid)):
+        if key in KEY_LABELS:
+            return KEY_LABELS[key]
+    return name
+
+
+def slots_for(dev):
+    """Remappable slots for a discovered device, from what it reports."""
+    name, kind = dev.get("name", ""), dev.get("kind", "")
+    group = device_kind_group(kind)
+    keys = dev.get("keys") or []
+    settings = set(dev.get("settings") or [])
+    slots = []
+    divertable = {k["cid"]: k for k in keys if k.get("divertable")}
+    if group == "mouse" and GESTURE_CID in divertable:
+        for sid, label, movements in GESTURE_SLOTS:
+            slots.append({"id": sid, "label": label, "section": "Gesture button", "scope": "gesture", "gesture": movements})
+    if "thumb-scroll-mode" in settings:
+        slots.append({"id": "thumb.left", "label": "Scroll left", "section": "Thumb wheel", "scope": "thumb"})
+        slots.append({"id": "thumb.right", "label": "Scroll right", "section": "Thumb wheel", "scope": "thumb"})
+    for k in keys:
+        cid = k.get("cid")
+        if not k.get("divertable") or cid in SKIP_CIDS or cid is None:
+            continue
+        slots.append({"id": f"key.0x{cid:x}", "label": key_label(name, k["name"], cid),
+                      "section": "Buttons" if group == "mouse" else "Keys",
+                      "scope": "button" if group == "mouse" else "key", "cid": cid, "key": k["name"]})
+    return slots
+
+
+def device_view(cfg, dev):
+    """Everything the panel needs for one device."""
+    name = dev["name"]
+    merged = merged_device(cfg, name, dev.get("kind"))
+    return {
+        "name": name,
+        "kind": dev.get("kind", ""),
+        "group": device_kind_group(dev.get("kind")),
+        "link": dev.get("link", "unknown"),
+        "serial": dev.get("serial", ""),
+        "available": sorted(dev.get("settings") or []),
+        "slots": slots_for(dev),
+        "config": merged,
+    }
+
+
+# --------------------------------------------------------------------------
+# Solaar writes
+# --------------------------------------------------------------------------
+
+BATCH_SNIPPET = r"""
+import json, logging, sys
+logging.disable(logging.CRITICAL)
+from logitech_receiver import base, receiver, device
+from solaar import configuration
+from solaar.cli import config as cli_config
+req = json.loads(sys.argv[1])
+def norm(s): return "".join(c for c in str(s).lower() if c.isalnum())
+target, opened = None, []
+for info in base.receivers_and_devices():
+    try:
+        if getattr(info, "isDevice", False):
+            d = device.create_device(base, info)
+            if d:
+                opened.append(d)
+                if norm(d.name) == norm(req["device"]): target = d
+        else:
+            r = receiver.create_receiver(base, info)
+            if not r: continue
+            opened.append(r)
+            for d in r:
+                if norm(d.name) == norm(req["device"]): target = d
+    except Exception:
+        pass
+    if target: break
+results = []
+if target is None or not target.online:
+    print(json.dumps({"offline": True, "results": results})); sys.exit(0)
+configuration.attach_to(target)
+class A: pass
+for setting_name, values, what in req["jobs"]:
+    values = [str(v) for v in values]
+    setting = next((s for s in target.settings if s.name == setting_name), None)
+    if setting is None:
+        results.append({"setting": setting_name, "ok": False, "msg": "no such setting on this device"}); continue
+    a = A(); a.value_key = values[0] if values else None
+    a.extra_subkey = values[1] if len(values) > 1 else None
+    a.extra2 = values[2] if len(values) > 2 else None
+    try:
+        result, message, value = cli_config.set(target, setting, a, True)
+        results.append({"setting": setting_name, "ok": result is not None, "msg": message or ""})
+    except Exception as ex:
+        results.append({"setting": setting_name, "ok": False, "msg": str(ex).splitlines()[-1] if str(ex) else "failed"})
+try:
+    configuration.save()
+except Exception:
+    pass
+for o in opened:
+    try: o.close()
+    except Exception: pass
+print(json.dumps({"offline": False, "results": results}))
+"""
+
+
+def solaar_batch(device, jobs):
+    """Write every setting for one device in a single Solaar session."""
+    req = json.dumps({"device": device, "jobs": [[j[0], [str(v) for v in j[1]], j[2]] for j in jobs]})
+    with solaar_lock(timeout=120):
+        rc, out, err = run(["python3", "-c", BATCH_SNIPPET, req], timeout=180)
+    try:
+        return json.loads(out.strip().splitlines()[-1]), ""
+    except (json.JSONDecodeError, IndexError):
+        return None, (err.strip().splitlines()[-1] if err.strip() else f"batch exited {rc}")
+
+
+def solaar_get(device, setting):
+    with solaar_lock():
+        rc, out, err = run(["solaar", "config", device, setting], timeout=25)
+    m = re.search(r"^\s*" + re.escape(setting) + r"\s*=\s*(.+)$", out, re.M)
+    return m.group(1).strip() if m else None
+
+
+def solaar_set(device, setting, *value):
+    data, err = solaar_batch(device, [(setting, list(value), setting)])
+    if data is None:
+        return False, err
+    if data.get("offline"):
+        return False, f"{device} is offline"
+    res = (data.get("results") or [{}])[0]
+    return bool(res.get("ok")), res.get("msg", "")
+
+
+def queue_pending(device, jobs):
+    pending = [j for j in load_json(PENDING_PATH, []) if isinstance(j, dict) and j.get("device", "").lower() != device.lower()]
+    for setting, values, what in jobs:
+        pending.append({"device": device, "setting": setting, "values": [str(v) for v in values], "what": what})
+    save_json(PENDING_PATH, pending)
+
+
+def set_all(device, jobs, warnings, notes, label):
+    stale = [j for j in load_json(PENDING_PATH, []) if isinstance(j, dict) and j.get("device", "").lower() != device.lower()]
+    save_json(PENDING_PATH, stale)
+    if not jobs:
+        return
+    data, err = solaar_batch(device, jobs)
+    if data is None:
+        warnings.append(f"{label}: could not write settings: {err}")
+        return
+    if data.get("offline"):
+        queue_pending(device, jobs)
+        notes.append(f"{label} is offline: {len(jobs)} setting(s) queued until it reconnects")
+        return
+    for job, res in zip(jobs, data.get("results", [])):
+        setting, values, what = job
+        shown = " ".join(str(v) for v in values)
+        if res.get("ok"):
+            notes.append(f"{label} {what}: {setting}={shown}")
+        elif "no such setting" in (res.get("msg") or ""):
+            notes.append(f"{label} {what}: not supported by this device, skipped")
+        else:
+            warnings.append(f"{label} {what} ({setting}={shown}) failed: {res.get('msg') or 'unknown error'}")
+
+
+# --------------------------------------------------------------------------
+# Generator: config -> jobs + rules
+# --------------------------------------------------------------------------
+
+
+class Generator:
+    def __init__(self, cfg, actions):
+        self.cfg = cfg
+        self.actions = actions
+        self.warnings = []
+        self.rules = []
+        self.scroll_factors = []  # (hypr device names, factor)
+
+    # ---- actions ----
+    def execute_component(self, command):
+        cmd = command.strip()
+        if not cmd:
+            return None
+        if re.search(r"[|&;<>$`(){}*?~]", cmd):
+            return {"Execute": ["bash", "-lc", cmd]}
+        try:
+            return {"Execute": shlex.split(cmd)}
+        except ValueError:
+            return {"Execute": ["bash", "-lc", cmd]}
+
+    def components(self, view, slot):
+        """[] = diverted, does nothing; None = keep device default."""
+        aid = str((view["config"].get("slots") or {}).get(slot["id"], "default" if slot["scope"] in ("button", "key") else "none"))
+        act = self.actions.get(aid)
+        if act is None:
+            self.warnings.append(f"{view['name']} / {slot['label']}: unknown action '{aid}'")
+            return []
+        kind = act["kind"]
+        if kind == "default":
+            return None
+        if kind == "none":
+            return []
+        if kind == "key":
+            if act.get("mouseclick"):
+                return [{"MouseClick": list(act["mouseclick"])}]
+            return [{"KeyPress": list(act["keysyms"])}]
+        if kind == "native":
+            return [{"Execute": [CLI_PATH, "native", aid, view["name"]]}]
+        if kind == "scroll":
+            return []
+        if kind in ("exec", "custom"):
+            command = (view["config"].get("custom") or {}).get(slot["id"], "").strip() if kind == "custom" else act["exec"]
+            if not command:
+                self.warnings.append(f"{view['name']} / {slot['label']}: custom action has no command")
+                return []
+            c = self.execute_component(command)
+            return [c] if c else []
+        return []
+
+    def slot_action(self, view, slot):
+        return str((view["config"].get("slots") or {}).get(slot["id"], "default" if slot["scope"] in ("button", "key") else "none"))
+
+    # ---- one device ----
+    def device_jobs(self, view):
+        st = view["config"].get("settings") or {}
+        avail = set(view["available"])
+        slots = view["slots"]
+        dev = {"Device": view["name"]}
+        jobs = []
+
+        def want(setting):
+            # a device recorded before the engine learned to list settings has
+            # an empty list: try everything and let Solaar skip what is missing
+            return (setting in avail) if avail else True
+
+        # pointer / wheel
+        if want("dpi") and st.get("dpi") is not None:
+            jobs.append(("dpi", [int(st["dpi"])], "pointer speed"))
+        if want("hires-smooth-resolution"):
+            jobs.append(("hires-smooth-resolution", ["true" if st.get("hires") else "false"], "smooth scrolling"))
+        if want("hires-smooth-invert"):
+            jobs.append(("hires-smooth-invert", ["true" if st.get("invertWheel") else "false"], "wheel direction"))
+        if want("hires-scroll-mode"):
+            jobs.append(("hires-scroll-mode", ["false"], "wheel diversion"))
+        if want("scroll-ratchet"):
+            jobs.append(("scroll-ratchet", ["Ratcheted" if st.get("smartshiftOn", True) else "Freespinning"], "ratchet"))
+        if want("smart-shift") and st.get("smartshiftOn", True):
+            jobs.append(("smart-shift", [max(1, min(50, int(st.get("smartshift", 10) or 10)))], "SmartShift sensitivity"))
+        if view["group"] == "mouse":
+            self.scroll_factors.append((view["config"].get("hyprDevices") or hypr_device_names(view["name"]), st.get("verticalScroll")))
+
+        # thumb wheel
+        thumb = [s for s in slots if s["scope"] == "thumb"]
+        if thumb and want("thumb-scroll-mode"):
+            if want("thumb-scroll-invert"):
+                jobs.append(("thumb-scroll-invert", ["true" if st.get("invertThumb") else "false"], "thumb wheel direction"))
+            threshold = int(st.get("horizontalThreshold", 0) or 0)
+            native = all(self.slot_action(view, s) == "scroll" for s in thumb) and threshold <= 0
+            jobs.append(("thumb-scroll-mode", ["false" if native else "true"], "thumb wheel"))
+            if not native:
+                left = next(s for s in thumb if s["id"] == "thumb.left")
+                right = next(s for s in thumb if s["id"] == "thumb.right")
+                sides = [(right, "thumb_wheel_up", 1), (left, "thumb_wheel_down", -1)]
+                if st.get("invertThumb"):
+                    sides = [(left, "thumb_wheel_up", -1), (right, "thumb_wheel_down", 1)]
+                for slot, test, sign in sides:
+                    cond = {"Test": [test, threshold]} if threshold > 0 else {"Test": test}
+                    act = self.actions.get(self.slot_action(view, slot))
+                    if act and act["kind"] == "scroll":
+                        comps = [{"MouseScroll": [sign, 0] if act.get("axis") == "REL_HWHEEL" else [0, sign]}]
+                    else:
+                        comps = self.components(view, slot) or []
+                    if comps:
+                        self.rules.append([dev, {"Feature": "THUMB WHEEL"}, cond] + comps)
+
+        # gesture button
+        gestures = [s for s in slots if s["scope"] == "gesture"]
+        if gestures and want("divert-keys"):
+            any_gesture = any(self.slot_action(view, s) != "none" for s in gestures)
+            jobs.append(("divert-keys", ["Mouse Gesture Button", "Mouse Gestures" if any_gesture else "Regular"], "gesture button"))
+            if any_gesture:
+                for s in gestures:
+                    comps = self.components(view, s)
+                    if comps:
+                        self.rules.append([dev, {"MouseGesture": list(s["gesture"])}] + comps)
+
+        # buttons / keys
+        if want("divert-keys"):
+            for s in slots:
+                if s["scope"] not in ("button", "key"):
+                    continue
+                comps = self.components(view, s)
+                jobs.append(("divert-keys", [s["key"], "Regular" if comps is None else "Diverted"], s["label"].lower()))
+                if comps:
+                    self.rules.append([dev, {"Key": [s["key"], "pressed"]}] + comps)
+
+        # keyboard
+        if want("fn-swap") and st.get("topRow") in ("fkeys", "media"):
+            jobs.append(("fn-swap", ["false" if st["topRow"] == "fkeys" else "true"], "top row"))
+        if want("multiplatform") and (st.get("layout") or "unchanged") != "unchanged":
+            jobs.append(("multiplatform", [st["layout"]], "layout"))
+        mode = st.get("backlightMode") or "unchanged"
+        if want("backlight") and mode in ("Automatic", "Manual", "Disabled"):
+            jobs.append(("backlight", [mode], "backlight"))
+            if mode == "Manual" and want("backlight_level") and st.get("backlightLevel") is not None:
+                jobs.append(("backlight_level", [int(st["backlightLevel"])], "backlight level"))
+            for key, setting, what in (("fadeHandsOut", "backlight_duration_hands_out", "fade (hands away)"),
+                                       ("fadeHandsIn", "backlight_duration_hands_in", "fade (hands near)"),
+                                       ("fadePowered", "backlight_duration_powered", "fade (on power)")):
+                if want(setting) and st.get(key) is not None:
+                    jobs.append((setting, [int(st[key])], what))
+        return jobs
+
+    def rules_yaml(self):
+        import yaml
+
+        header = ("%YAML 1.3\n"
+                  "# Generated by omaoptions — do not edit by hand.\n"
+                  "# Change settings in the OmaOptions bar panel or ~/.config/omarchy/omaoptions/config.json,\n"
+                  "# then run `omaoptions apply`. Solaar's own GUI would overwrite this file.\n")
+        if not self.rules:
+            return header + "---\n- Feature: ROOT\n...\n"
+        return header + yaml.safe_dump_all(self.rules, explicit_start=True, explicit_end=True, sort_keys=False,
+                                           default_flow_style=None, allow_unicode=True)
+
+
+def write_hypr_lua(scroll_factors, warnings, notes):
+    lines = ["-- Generated by omaoptions — do not edit by hand.",
+             "-- Vertical scroll speed per Logitech mouse (Hyprland per-device scroll_factor).",
+             "-- Change it in the OmaOptions bar panel, then Apply.", ""]
+    seen = set()
+    for names, raw in scroll_factors:
+        if raw in (None, "", "unchanged"):
+            continue
+        factor = max(0.02, min(5.0, float(raw)))
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            lines.append(f'hl.device({{ name = "{name}", scroll_factor = {factor:g} }})')
+    if not seen:
+        lines.append("-- Vertical scroll speed follows Hyprland's global input.scroll_factor.")
+    os.makedirs(os.path.dirname(HYPR_LUA), exist_ok=True)
+    with open(HYPR_LUA, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        main = open(HYPR_MAIN).read()
+    except OSError:
+        main = ""
+    if main and "hypr.omaoptions" not in main:
+        with open(HYPR_MAIN, "a") as f:
+            f.write("\n-- OmaOptions: per-device scroll speed for Logitech mice (omaoptions apply).\n"
+                    "require(\"default.hypr.require_optional\").module(\"hypr.omaoptions\")\n")
+        notes.append("hooked hypr/omaoptions.lua into hyprland.lua")
+    if have("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        run(["hyprctl", "reload"], timeout=20)
+        rc, out, err = run(["hyprctl", "configerrors"], timeout=10)
+        errs = out.strip()
+        if errs and not re.search(r"no errors", errs, re.I):
+            warnings.append("Hyprland config errors: " + errs[:300])
+        else:
+            notes.append("hyprland reloaded (scroll factors: " + (", ".join(f"{n}={f}" for n, f in
+                         [(names[0], raw) for names, raw in scroll_factors if raw not in (None, "", "unchanged")]) or "global") + ")")
+
+
+# --------------------------------------------------------------------------
+# Engine / status
+# --------------------------------------------------------------------------
+
+
+def service_state():
+    rc, out, _ = run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
+    rc2, out2, _ = run(["systemctl", "--user", "is-enabled", SERVICE], timeout=5)
+    return {"active": out.strip() or "unknown", "enabled": out2.strip() or "unknown"}
+
+
+def unit_installed():
+    return os.path.exists(os.path.join(HOME, ".config", "systemd", "user", SERVICE))
+
+
+def service(cmd):
+    rc, out, err = run(["systemctl", "--user", cmd, SERVICE], timeout=30)
+    return rc == 0, (err or out).strip()
+
+
+PROBE_SNIPPET = r"""
+import json, logging, sys
+logging.disable(logging.CRITICAL)
+from logitech_receiver import base, receiver, device
+try:
+    from logitech_receiver.hidpp20 import KeyFlag
+except Exception:
+    KeyFlag = None
+want_keys = len(sys.argv) > 1 and sys.argv[1] == "keys"
+out = []
+def describe(d, link):
+    e = {"name": str(d.name or ""), "kind": str(d.kind or ""), "link": link, "online": bool(d.online),
+         "serial": str(getattr(d, "serial", "") or ""), "battery": None, "charging": False, "keys": [], "settings": []}
+    if d.online:
+        try:
+            b = d.battery()
+            if b is not None:
+                e["battery"] = int(b.level) if b.level is not None else None
+                st = str(b.status).lower() if b.status is not None else ""
+                e["charging"] = ("recharg" in st) or ("almost_full" in st)
+        except Exception as ex:
+            e["error"] = str(ex)
+        if want_keys:
+            try:
+                ks = d.keys
+                for i in range(len(ks) if ks is not None else 0):
+                    k = ks[i]
+                    if k is None: continue
+                    flags = k.flags
+                    try:
+                        div = True if (flags is None or KeyFlag is None) else (KeyFlag.DIVERTABLE in flags)
+                    except TypeError:
+                        div = bool(int(getattr(flags, "value", flags)) & 0x20)
+                    e["keys"].append({"name": str(k.key), "cid": int(k.key), "divertable": bool(div)})
+                e["settings"] = sorted({str(s.name) for s in (d.settings or [])})
+            except Exception as ex:
+                e["keysError"] = str(ex)
+    return e
+for info in base.receivers_and_devices():
+    try:
+        if getattr(info, "isDevice", False):
+            d = device.create_device(base, info)
+            if d:
+                out.append(describe(d, "bluetooth" if getattr(info, "bus_id", None) == 5 else "usb")); d.close()
+        else:
+            r = receiver.create_receiver(base, info)
+            if not r: continue
+            for d in r: out.append(describe(d, "receiver"))
+            r.close()
+    except Exception as ex:
+        out.append({"error": str(ex)})
+print(json.dumps(out))
+"""
+
+
+def probe_devices(with_keys=False):
+    if not have("solaar"):
+        return None, "solaar is not installed"
+    cmd = ["python3", "-c", PROBE_SNIPPET] + (["keys"] if with_keys else [])
+    try:
+        with solaar_lock():
+            rc, out, err = run(cmd, timeout=60)
+    except TimeoutError as ex:
+        return None, str(ex)
+    try:
+        data = json.loads(out.strip().splitlines()[-1]) if out.strip() else None
+    except (json.JSONDecodeError, IndexError):
+        data = None
+    if data is None:
+        return None, (err.strip().splitlines()[-1] if err.strip() else f"probe exited {rc}")
+    return [d for d in data if "name" in d], ""
+
+
+def device_status():
+    """Prefer the engine's status file (no HID++ traffic); probe only if the engine is down."""
+    st = service_state()
+    status = load_json(STATUS_PATH, {})
+    fresh = st["active"] == "active" and status.get("at") and time.time() - status["at"] < 1800
+    err, source = "", "engine"
+    if fresh:
+        devices = status.get("devices", [])
+    elif st["active"] != "active":
+        if lock_busy():
+            devices, source = status.get("devices", []), "busy"
+        else:
+            devices, err = probe_devices()
+            devices, source = devices or [], "probe"
+    else:
+        devices, source = status.get("devices", []), "engine-stale"
+    result = []
+    known = {d["name"]: d for d in discovered_devices()}
+    for d in devices:
+        online = bool(d.get("online"))
+        last = d.get("lastOnline")
+        sleeping = (not online) and bool(last) and (time.time() - last) < 1800
+        result.append({
+            "name": d["name"], "kind": d.get("kind") or known.get(d["name"], {}).get("kind", ""),
+            "group": device_kind_group(d.get("kind") or known.get(d["name"], {}).get("kind")),
+            "connected": online or sleeping, "idle": sleeping,
+            "battery": d.get("battery"), "charging": bool(d.get("charging")), "link": d.get("link", "unknown"),
+        })
+    return result, err, source
+
+
+def installed_info():
+    return {"solaar": have("solaar"), "unit": unit_installed(), "voxtype": have("voxtype"),
+            "uinput": os.access("/dev/uinput", os.W_OK)}
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def cmd_defaults(_args):
+    print(json.dumps({"settings": GENERIC_SETTINGS, "slots": GENERIC_SLOTS, "models": MODEL_DEFAULTS}, indent=2))
+
+
+def cmd_get(_args):
+    cfg = load_config()
+    _, actions = load_actions()
+    discovered = discovered_devices()
+    views = [device_view(cfg, d) for d in discovered]
+    # devices in the config that were never discovered: show them read-only
+    for name, entry in (cfg.get("devices") or {}).items():
+        if not any(v["name"] == name for v in views):
+            views.append(device_view(cfg, {"name": name, "kind": entry.get("kind", ""), "keys": [], "settings": []}) | {"unseen": True})
+    print(json.dumps({
+        "config": cfg,
+        "devices": views,
+        "actions": actions,
+        "lastApply": load_state().get("lastApply"),
+        "installed": installed_info(),
+        "paths": {"config": CONFIG_PATH, "rules": RULES_PATH, "solaar": os.path.join(SOLAAR_DIR, "config.yaml")},
+    }))
+
+
+def cmd_apply(args):
+    if args.json:
+        try:
+            incoming = json.loads(args.json)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"--json: invalid JSON: {e}")
+        cfg = migrate(incoming)
+    else:
+        cfg = load_config()
+    cfg.setdefault("version", CONFIG_VERSION)
+    cfg.setdefault("devices", {})
+    save_config(cfg)
+
+    actions_by_id, _ = load_actions()
+    gen = Generator(cfg, actions_by_id)
+    warnings, notes = [], []
+    views = [device_view(cfg, d) for d in discovered_devices()]
+    per_device = [(v, gen.device_jobs(v)) for v in views]
+    warnings.extend(gen.warnings)
+
+    os.makedirs(SOLAAR_DIR, exist_ok=True)
+    with open(RULES_PATH, "w") as f:
+        f.write(gen.rules_yaml())
+    notes.append(f"wrote {RULES_PATH} ({len(gen.rules)} rules for {len(views)} device(s))")
+    if not args.no_restart:
+        write_hypr_lua(gen.scroll_factors, warnings, notes)
+
+    if not have("solaar"):
+        warnings.append("solaar is not installed — run install.sh")
+    elif not args.no_restart:
+        was_active = service_state()["active"] == "active"
+        if was_active:
+            service("stop")
+            time.sleep(0.8)
+        try:
+            for view, jobs in per_device:
+                set_all(view["name"], jobs, warnings, notes, view["name"])
+        except Exception as ex:
+            warnings.append(f"writing settings failed: {ex}")
+        if unit_installed():
+            ok, msg = service("restart")
+            time.sleep(1.5)
+            st = service_state()
+            if ok and st["active"] == "active":
+                notes.append("engine restarted")
+            else:
+                rc, out, err = run(["journalctl", "--user", "-u", SERVICE, "-n", "5", "--no-pager", "-o", "cat"], timeout=10)
+                warnings.append(f"engine not running ({st['active']}): {msg or out.strip().replace(chr(10), ' | ')}")
+        else:
+            warnings.append("engine service not installed — run install.sh")
+    else:
+        notes.append("settings not written (--no-restart)")
+
+    state = load_state()
+    state["lastApply"] = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "warnings": warnings, "notes": notes}
+    save_state(state)
+    print(json.dumps({"ok": not warnings, "warnings": warnings, "notes": notes}))
+    return 0
+
+
+def cmd_status(_args):
+    devices, err, source = device_status()
+    print(json.dumps({
+        "devices": devices,
+        "service": service_state(),
+        "installed": installed_info(),
+        "source": source,
+        "error": err or None,
+        "lastApply": load_state().get("lastApply"),
+    }))
+
+
+def cmd_discover(_args):
+    devices = discovered_devices()
+    err = None
+    if not devices or service_state()["active"] != "active":
+        probed, err = probe_devices(with_keys=True)
+        if probed:
+            devices = probed
+            save_json(DEVICES_PATH, {"at": time.time(), "devices": devices})
+    print(json.dumps({"error": err or None, "devices": devices}, indent=2))
+    return 0 if devices else 1
+
+
+def cmd_native(args):
+    """Built-in actions run from rules: omaoptions native <id> [device name]."""
+    cfg = load_config()
+    name = args.device
+    if not name:
+        mice = [d for d in discovered_devices() if device_kind_group(d.get("kind")) == "mouse"]
+        name = mice[0]["name"] if mice else None
+    if not name:
+        print("no mouse known", file=sys.stderr)
+        return 1
+    st = merged_device(cfg, name, "mouse")["settings"]
+    aid = args.action
+    if aid == "toggle-smartshift":
+        cur = (solaar_get(name, "scroll-ratchet") or "").lower()
+        ok, msg = solaar_set(name, "scroll-ratchet", "Freespinning" if "ratchet" in cur else "Ratcheted")
+    elif aid == "toggle-hires":
+        ok, msg = solaar_set(name, "hires-smooth-resolution", "~")
+    elif aid in ("cycle-dpi", "dpi-up", "dpi-down"):
+        cur = int(re.sub(r"\D", "", solaar_get(name, "dpi") or "1000") or 1000)
+        presets = sorted(set(int(p) for p in st.get("dpiPresets") or [800, 1000, 1600]))
+        if aid == "cycle-dpi":
+            nxt = next((p for p in presets if p > cur), presets[0])
+        else:
+            nxt = int(round(max(200, min(8000, cur + (200 if aid == "dpi-up" else -200))) / 50.0) * 50)
+        ok, msg = solaar_set(name, "dpi", nxt)
+    elif aid in ("host-next", "host-prev"):
+        ok, msg = solaar_set(name, "change-host", "higher" if aid == "host-next" else "lower")
+    else:
+        ok, msg = False, f"unknown native action {aid}"
+    if not ok:
+        print(msg, file=sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_doctor(_args):
+    cfg = load_config()
+
+    def section(title):
+        print("\n=== " + title + " ===")
+
+    section("binaries")
+    for b in ("solaar", "hyprctl", "voxtype"):
+        print(f"{b:10s} {shutil.which(b) or 'MISSING'}")
+    print("python-evdev:", "ok" if run(["python3", "-c", "import evdev"], timeout=10)[0] == 0 else "MISSING")
+    section("engine service (user)")
+    print(json.dumps(service_state()), "unit installed:", unit_installed())
+    rc, out, err = run(["journalctl", "--user", "-u", SERVICE, "-n", "30", "--no-pager"], timeout=10)
+    print(out or err)
+    section("permissions")
+    print("/etc/udev/rules.d/70-omaoptions.rules:", "present" if os.path.exists("/etc/udev/rules.d/70-omaoptions.rules") else "missing")
+    for dev in sorted(os.listdir("/dev")):
+        if dev.startswith("hidraw") or dev == "uinput":
+            path = "/dev/" + dev
+            print(f"{path}: {'rw' if os.access(path, os.R_OK | os.W_OK) else 'no user access'}")
+    section("status.json (engine)")
+    print(json.dumps(load_json(STATUS_PATH, {}), indent=2))
+    section("devices.json (engine)")
+    print(json.dumps(load_json(DEVICES_PATH, {}), indent=2))
+    section("config.json")
+    print(json.dumps(cfg, indent=2))
+    section("rules.yaml")
+    try:
+        print(open(RULES_PATH).read())
+    except OSError as e:
+        print(e)
+    section("hypr/omaoptions.lua")
+    try:
+        print(open(HYPR_LUA).read())
+    except OSError as e:
+        print(e)
+    section("last apply")
+    print(json.dumps(load_state().get("lastApply"), indent=2))
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="omaoptions", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("get").set_defaults(fn=cmd_get)
+    p = sub.add_parser("apply")
+    p.add_argument("--json", help="full config JSON to save before applying")
+    p.add_argument("--no-restart", action="store_true", help="only write config + rules; do not touch the devices or the engine")
+    p.set_defaults(fn=cmd_apply)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("discover").set_defaults(fn=cmd_discover)
+    p = sub.add_parser("native")
+    p.add_argument("action")
+    p.add_argument("device", nargs="?")
+    p.set_defaults(fn=cmd_native)
+    sub.add_parser("doctor").set_defaults(fn=cmd_doctor)
+    sub.add_parser("defaults").set_defaults(fn=cmd_defaults)
+    args = ap.parse_args(argv)
+    return args.fn(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

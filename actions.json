@@ -1,0 +1,1119 @@
+{
+  "_comment": "Action catalog shared by bin/omaoptions (generator) and Panel.qml (UI). kind: default = leave the device's own behaviour (no divert); none = divert and do nothing; key = Solaar KeyPress/MouseClick (keysyms); exec = Solaar Execute (shell command, split shell-style); native = built-in Solaar setting change; scroll = thumb-wheel scroll emulation; custom = user-typed command. scopes: which slot groups offer the action.",
+  "actions": [
+    {
+      "id": "default",
+      "label": "Device default",
+      "group": "General",
+      "kind": "default",
+      "scopes": [
+        "button",
+        "key",
+        "thumbextra"
+      ]
+    },
+    {
+      "id": "none",
+      "label": "Do nothing",
+      "group": "General",
+      "kind": "none",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "custom",
+      "label": "Custom command…",
+      "group": "General",
+      "kind": "custom",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "scroll",
+      "label": "Horizontal scroll",
+      "group": "Scroll",
+      "kind": "scroll",
+      "axis": "REL_HWHEEL",
+      "scopes": [
+        "thumb"
+      ]
+    },
+    {
+      "id": "scroll-vertical",
+      "label": "Vertical scroll",
+      "group": "Scroll",
+      "kind": "scroll",
+      "axis": "REL_WHEEL",
+      "scopes": [
+        "thumb"
+      ]
+    },
+    {
+      "id": "workspace-next",
+      "label": "Next workspace",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.focus({ workspace = \"e+1\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "workspace-prev",
+      "label": "Previous workspace",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.focus({ workspace = \"e-1\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "workspace-next-new",
+      "label": "Next workspace (create if needed)",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.focus({ workspace = \"+1\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "workspace-prev-new",
+      "label": "Previous workspace (create if needed)",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.focus({ workspace = \"-1\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "window-to-next-workspace",
+      "label": "Move window to next workspace",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.move({ workspace = \"+1\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "window-to-prev-workspace",
+      "label": "Move window to previous workspace",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.move({ workspace = \"-1\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "scratchpad",
+      "label": "Toggle scratchpad (special workspace)",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.workspace.toggle_special(\"scratchpad\")'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "window-to-scratchpad",
+      "label": "Move window to scratchpad",
+      "group": "Workspaces",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.move({ workspace = \"special:scratchpad\", follow = false })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "window-next",
+      "label": "Focus next window",
+      "group": "Windows",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.cycle_next()'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "window-prev",
+      "label": "Focus previous window",
+      "group": "Windows",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.cycle_next({ next = false })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "fullscreen",
+      "label": "Toggle fullscreen",
+      "group": "Windows",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.fullscreen({ mode = \"fullscreen\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "float",
+      "label": "Toggle floating",
+      "group": "Windows",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.float({ action = \"toggle\" })'",
+      "scopes": [
+        "gesture",
+        "thumb",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "close-window",
+      "label": "Close window",
+      "group": "Windows",
+      "kind": "exec",
+      "exec": "hyprctl dispatch 'hl.dsp.window.close()'",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "alt-tab",
+      "label": "Alt+Tab",
+      "group": "Windows",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTALT",
+        "KEY_TAB"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "ALT",
+        "Tab"
+      ]
+    },
+    {
+      "id": "omarchy-menu",
+      "label": "Omarchy menu",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-menu toggle",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "launcher",
+      "label": "App launcher",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-menu toggle apps",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "emoji",
+      "label": "Emoji picker",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-shell shell toggle omarchy.emojis",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "clipboard",
+      "label": "Clipboard history",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-shell shell toggle omarchy.clipboard",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "screenshot",
+      "label": "Screenshot",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-capture-screenshot",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "capture-menu",
+      "label": "Capture menu (screenshot / record)",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-menu toggle capture",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "system-menu",
+      "label": "System menu",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-menu toggle system",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "lock",
+      "label": "Lock screen",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-system-lock",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "keybindings",
+      "label": "Show keybindings",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-menu-keybindings",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "dictation",
+      "label": "Dictation (voxtype toggle)",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "voxtype record toggle",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "mic-mute",
+      "label": "Mute / unmute microphone",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-audio-input-mute",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "audio-panel",
+      "label": "Audio panel",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-shell shell toggle omarchy.audio",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "night-light",
+      "label": "Toggle night light",
+      "group": "Omarchy",
+      "kind": "exec",
+      "exec": "omarchy-toggle-nightlight",
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "volume-up",
+      "label": "Volume up",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_VOLUMEUP"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_AudioRaiseVolume"
+      ]
+    },
+    {
+      "id": "volume-down",
+      "label": "Volume down",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_VOLUMEDOWN"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_AudioLowerVolume"
+      ]
+    },
+    {
+      "id": "mute",
+      "label": "Mute audio",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_MUTE"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_AudioMute"
+      ]
+    },
+    {
+      "id": "play-pause",
+      "label": "Play / pause",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_PLAYPAUSE"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_AudioPlay"
+      ]
+    },
+    {
+      "id": "next-track",
+      "label": "Next track",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_NEXTSONG"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_AudioNext"
+      ]
+    },
+    {
+      "id": "prev-track",
+      "label": "Previous track",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_PREVIOUSSONG"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_AudioPrev"
+      ]
+    },
+    {
+      "id": "brightness-up",
+      "label": "Screen brightness up",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_BRIGHTNESSUP"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_MonBrightnessUp"
+      ]
+    },
+    {
+      "id": "brightness-down",
+      "label": "Screen brightness down",
+      "group": "Media",
+      "kind": "key",
+      "keys": [
+        "KEY_BRIGHTNESSDOWN"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_MonBrightnessDown"
+      ]
+    },
+    {
+      "id": "back",
+      "label": "Back (browser / file manager)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "BTN_SIDE"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_Back"
+      ]
+    },
+    {
+      "id": "forward",
+      "label": "Forward (browser / file manager)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "BTN_EXTRA"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "XF86_Forward"
+      ]
+    },
+    {
+      "id": "middle-click",
+      "label": "Middle click",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "BTN_MIDDLE"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "mouseclick": [
+        "middle",
+        "click"
+      ]
+    },
+    {
+      "id": "tab-next",
+      "label": "Next tab (Ctrl+Tab)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_TAB"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "Tab"
+      ]
+    },
+    {
+      "id": "tab-prev",
+      "label": "Previous tab (Ctrl+Shift+Tab)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_LEFTSHIFT",
+        "KEY_TAB"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "SHIFT",
+        "Tab"
+      ]
+    },
+    {
+      "id": "tab-close",
+      "label": "Close tab (Ctrl+W)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_W"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "w"
+      ]
+    },
+    {
+      "id": "tab-new",
+      "label": "New tab (Ctrl+T)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_T"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "t"
+      ]
+    },
+    {
+      "id": "zoom-in",
+      "label": "Zoom in (Ctrl++)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_EQUAL"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "equal"
+      ]
+    },
+    {
+      "id": "zoom-out",
+      "label": "Zoom out (Ctrl+-)",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_MINUS"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "minus"
+      ]
+    },
+    {
+      "id": "page-up",
+      "label": "Page up",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_PAGEUP"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "Page_Up"
+      ]
+    },
+    {
+      "id": "page-down",
+      "label": "Page down",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_PAGEDOWN"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "Page_Down"
+      ]
+    },
+    {
+      "id": "home",
+      "label": "Home",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_HOME"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "Home"
+      ]
+    },
+    {
+      "id": "end",
+      "label": "End",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_END"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "End"
+      ]
+    },
+    {
+      "id": "escape",
+      "label": "Escape",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_ESC"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "Escape"
+      ]
+    },
+    {
+      "id": "enter",
+      "label": "Enter",
+      "group": "Navigation",
+      "kind": "key",
+      "keys": [
+        "KEY_ENTER"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "Return"
+      ]
+    },
+    {
+      "id": "copy",
+      "label": "Copy (Ctrl+C)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_C"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "c"
+      ]
+    },
+    {
+      "id": "paste",
+      "label": "Paste (Ctrl+V)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_V"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "v"
+      ]
+    },
+    {
+      "id": "cut",
+      "label": "Cut (Ctrl+X)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_X"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "x"
+      ]
+    },
+    {
+      "id": "undo",
+      "label": "Undo (Ctrl+Z)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_Z"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "z"
+      ]
+    },
+    {
+      "id": "redo",
+      "label": "Redo (Ctrl+Shift+Z)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_LEFTSHIFT",
+        "KEY_Z"
+      ],
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "SHIFT",
+        "z"
+      ]
+    },
+    {
+      "id": "select-all",
+      "label": "Select all (Ctrl+A)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_A"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "a"
+      ]
+    },
+    {
+      "id": "save",
+      "label": "Save (Ctrl+S)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_S"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "s"
+      ]
+    },
+    {
+      "id": "find",
+      "label": "Find (Ctrl+F)",
+      "group": "Editing",
+      "kind": "key",
+      "keys": [
+        "KEY_LEFTCTRL",
+        "KEY_F"
+      ],
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ],
+      "keysyms": [
+        "CTRL",
+        "f"
+      ]
+    },
+    {
+      "id": "toggle-smartshift",
+      "label": "Toggle SmartShift (ratchet / free spin)",
+      "group": "Mouse",
+      "kind": "native",
+      "native": {
+        "type": "ToggleSmartShift"
+      },
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button"
+      ]
+    },
+    {
+      "id": "toggle-hires",
+      "label": "Toggle smooth scrolling",
+      "group": "Mouse",
+      "kind": "native",
+      "native": {
+        "type": "ToggleHiresScroll"
+      },
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button"
+      ]
+    },
+    {
+      "id": "cycle-dpi",
+      "label": "Cycle DPI presets",
+      "group": "Mouse",
+      "kind": "native",
+      "native": {
+        "type": "CycleDPI"
+      },
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button"
+      ]
+    },
+    {
+      "id": "dpi-up",
+      "label": "DPI +200",
+      "group": "Mouse",
+      "kind": "native",
+      "native": {
+        "type": "ChangeDPI",
+        "inc": 200
+      },
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button"
+      ]
+    },
+    {
+      "id": "dpi-down",
+      "label": "DPI -200",
+      "group": "Mouse",
+      "kind": "native",
+      "native": {
+        "type": "ChangeDPI",
+        "inc": -200
+      },
+      "scopes": [
+        "gesture",
+        "thumb",
+        "button"
+      ]
+    },
+    {
+      "id": "host-next",
+      "label": "Switch to next host (Easy-Switch)",
+      "group": "Mouse",
+      "kind": "native",
+      "native": {
+        "type": "ChangeHost",
+        "host": "next"
+      },
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    },
+    {
+      "id": "host-prev",
+      "label": "Switch to previous host (Easy-Switch)",
+      "group": "Mouse",
+      "kind": "native",
+      "native": {
+        "type": "ChangeHost",
+        "host": "prev"
+      },
+      "scopes": [
+        "gesture",
+        "thumbextra",
+        "button",
+        "key"
+      ]
+    }
+  ]
+}

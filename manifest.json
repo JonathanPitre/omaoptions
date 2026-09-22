@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "andreinita21.omaoptions",
+  "name": "OmaOptions",
+  "version": "1.0.0",
+  "author": "andreinita21",
+  "license": "MIT",
+  "description": "Logi Options for Omarchy, powered by Solaar: gestures, thumb wheel, buttons, DPI and SmartShift on the MX Master 3S; F-row, OS layout, backlight and special keys on the MX Keys Mini; battery for both in the bar. Works over Logi Bolt and Bluetooth.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaOptions",
+    "description": "Battery and settings for the Logitech MX mouse and keyboard",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 120,
+      "showPercentage": "On"
+    },
+    "schema": [
+      {
+        "key": "showPercentage",
+        "type": "enum",
+        "label": "Battery percentages in the bar",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On",
+        "description": "Right-click the widget to toggle."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Battery refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 120
+      }
+    ]
+  }
+}
