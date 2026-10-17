@@ -18,6 +18,8 @@ It talks to the Bolt receiver and to Bluetooth devices the way Solaar does,
 which — unlike logiops 0.3.x — actually works on this hardware.
 """
 
+from copy import deepcopy
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -34,6 +36,9 @@ STATUS_PATH = os.path.join(STATE_DIR, "status.json")
 DEVICES_PATH = os.path.join(STATE_DIR, "devices.json")
 PENDING_PATH = os.path.join(STATE_DIR, "pending.json")
 BATTERY_POLL_SEC = 300
+RECOVERY_SETTINGS = ("fn-swap", "divert-keys")
+RECOVERY_DELAY_MS = 1500
+RECOVERY_MAX_DELAY_MS = 30000
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
 for noisy in ("logitech_receiver.base", "logitech_receiver.hidpp20", "logitech_receiver.device", "logitech_receiver.receiver",
@@ -52,6 +57,10 @@ if not Gtk.init_check()[0]:
     log.warning("no display: simulated key presses will not work until the session is up")
 
 from solaar import configuration, listener  # noqa: E402
+from logitech_receiver import settings_templates  # noqa: E402
+from logitech_receiver.hidpp20 import Hidpp20, MappingFlag  # noqa: E402
+from logitech_receiver.hidpp20_constants import SupportedFeature  # noqa: E402
+from logitech_receiver.settings import SENSITIVITY_IGNORE  # noqa: E402
 
 try:
     from solaar import dbus as solaar_dbus
@@ -66,8 +75,38 @@ except Exception:  # pragma: no cover
 # path -> Device (devices only, never receivers)
 _devices = {}
 _keys_recorded = set()
+_recoveries = {}
+_hidpp20 = Hidpp20()
 _last_online = {}   # serial/name -> time.time() when last seen online
 _last_battery = {}  # serial/name -> (level, charging, full)
+
+
+@dataclass
+class DeviceRecovery:
+    device: object
+    source: int = 0
+    delay: int = RECOVERY_DELAY_MS
+    restored: set = field(default_factory=set)
+    saved: dict | None = None
+
+
+class DeviceReadback:
+    def __init__(self, device):
+        self.device = device
+
+    def __getattr__(self, name):
+        return getattr(self.device, name)
+
+    def feature_request(self, *args, **kwargs):
+        # Solaar's key reporting reader converts FeatureCallError into default
+        # flags. Confirmation must preserve a missing reply as a failure.
+        try:
+            reply = self.device.feature_request(*args, **kwargs)
+        except Exception as ex:
+            raise OSError(f"setting confirmation failed: {ex}") from ex
+        if not reply:
+            raise OSError("device did not answer setting confirmation")
+        return reply
 
 
 def _atomic_write(path, payload):
@@ -138,15 +177,21 @@ def write_status():
 
 def record_keys(device):
     key = str(getattr(device, "serial", "") or device.name)
-    if key in _keys_recorded or not device.online:
-        return
+    if not device.online:
+        return False
     keys = []
     try:
         ks = device.keys
+        if not ks and device.protocol >= 2.0:
+            features = device.features
+            if (not features or (device.persister or {}).get("divert-keys") is not None
+                    or SupportedFeature.REPROG_CONTROLS_V2 in features
+                    or SupportedFeature.REPROG_CONTROLS_V4 in features):
+                return False
         for i in range(len(ks) if ks is not None else 0):
             k = ks[i]
             if k is None:
-                continue
+                return False
             flags = k.flags
             if flags is None or KeyFlag is None:
                 divertable = True
@@ -158,15 +203,27 @@ def record_keys(device):
             keys.append({"name": str(k.key), "cid": int(k.key), "divertable": bool(divertable)})
     except Exception as ex:
         log.warning("could not read keys of %s: %s", device.name, ex)
-        return
-    _keys_recorded.add(key)
-    settings = []
+        return False
     try:
-        settings = sorted({str(st.name) for st in (device.settings or [])})
+        settings = device.settings
+        # Solaar can latch feature discovery before keys are ready. Retry it
+        # against the same list so missing settings are added without duplicates.
+        if device.protocol >= 2.0 and not settings_templates.check_feature_settings(device, settings):
+            return False
+        settings = sorted({str(st.name) for st in settings})
+        saved = device.persister or {}
+        required = {name for name in RECOVERY_SETTINGS if saved.get(name) is not None
+                    and saved.get("_sensitive", {}).get(name) != SENSITIVITY_IGNORE}
+        if not required.issubset(settings) or not device.online:
+            return False
     except Exception as ex:
         log.warning("could not read settings of %s: %s", device.name, ex)
+        return False
+    if not keys or key in _keys_recorded:
+        return True
     try:
-        existing = json.load(open(DEVICES_PATH)).get("devices", [])
+        with open(DEVICES_PATH) as f:
+            existing = json.load(f).get("devices", [])
     except Exception:
         existing = []
     existing = [e for e in existing if e.get("name") != str(device.name)]
@@ -174,31 +231,107 @@ def record_keys(device):
                      "serial": str(getattr(device, "serial", "") or ""), "online": True,
                      "keys": keys, "settings": settings})
     _atomic_write(DEVICES_PATH, {"at": time.time(), "devices": existing})
+    _keys_recorded.add(key)
     log.info("%s: %d remappable keys recorded", device.name, sum(1 for k in keys if k["divertable"]))
+    return True
+
+
+def cancel_recovery(key):
+    recovery = _recoveries.pop(key, None)
+    if recovery is not None:
+        if recovery.source:
+            GLib.source_remove(recovery.source)
+        _keys_recorded.discard(str(getattr(recovery.device, "serial", "") or recovery.device.name))
+
+
+def confirm_setting(device, setting, value):
+    probe = DeviceReadback(device)
+    if setting.name == "fn-swap":
+        fresh = type(setting).build(probe)
+        if fresh is None:
+            return False
+        # A new non-persisting setting cannot fall back to the saved value
+        # when a live read fails, or rewrite the applied snapshot.
+        fresh.persist = False
+        return fresh.read(cached=False) == value
+    keys = _hidpp20.get_keys(probe)
+    if not keys:
+        return False
+    for cid, desired in value.items():
+        index = keys.index(int(cid))
+        if index is None or (MappingFlag.DIVERTED in keys[index].mapping_flags) != bool(desired):
+            return False
+    return True
+
+
+def recover_device(key, recovery):
+    device = recovery.device
+    if _recoveries.get(key) is not recovery:
+        return False
+    recovery.source = 0
+    if not device.online or not bool(device):
+        cancel_recovery(key)
+        return False
+    try:
+        if recovery.saved is None:
+            saved = device.persister
+            if saved is None:
+                raise RuntimeError("Solaar configuration is not ready")
+            recovery.saved = deepcopy(dict(saved))
+        if record_keys(device):
+            saved = recovery.saved
+            settings = {s.name: s for s in device.settings}
+            complete = True
+            for name in RECOVERY_SETTINGS:
+                value = saved.get(name)
+                if name in recovery.restored or value is None or saved.get("_sensitive", {}).get(name) == SENSITIVITY_IGNORE:
+                    continue
+                setting = settings.get(name)
+                if setting is None:
+                    complete = False
+                    continue
+                # False is a successful write.
+                written = setting.write(deepcopy(value), save=False)
+                confirmed = confirm_setting(device, setting, value)
+                if written is None or not confirmed:
+                    complete = False
+                else:
+                    recovery.restored.add(name)
+            if complete and apply_pending(device):
+                log.info("%s: saved key settings restored", device.name)
+                return False
+    except Exception as ex:
+        log.warning("%s: device recovery failed: %s", device.name, ex)
+    if device.online and bool(device):
+        recovery.source = GLib.timeout_add(recovery.delay, recover_device, key, recovery)
+        recovery.delay = min(recovery.delay * 2, RECOVERY_MAX_DELAY_MS)
+    else:
+        cancel_recovery(key)
+    return False
 
 
 def apply_pending(device):
     """Settings `omaoptions apply` could not write because the device was
     offline are queued in pending.json; write them now that it is online."""
     try:
-        pending = json.load(open(PENDING_PATH))
+        with open(PENDING_PATH) as f:
+            pending = json.load(f)
     except Exception:
-        return
+        return True
     mine = [j for j in pending if j.get("device", "").lower() == str(device.name).lower()]
     if not mine or not device.online:
-        return
+        return not mine
     try:
         from solaar.cli import config as cli_config
     except Exception as ex:
         log.warning("cannot apply pending settings: %s", ex)
-        return
+        return False
     done = []
     for job in mine:
         try:
             setting = next((s for s in device.settings if s.name == job["setting"]), None)
             if setting is None:
                 log.warning("%s: no setting %s", device.name, job["setting"])
-                done.append(job)
                 continue
             vals = [str(v) for v in job.get("values", [])]
 
@@ -210,7 +343,12 @@ def apply_pending(device):
             a.extra2 = vals[2] if len(vals) > 2 else None
             result, message, value = cli_config.set(device, setting, a, True)
             log.info("%s: %s", device.name, message or f"{job['setting']}={vals}")
-            done.append(job)
+            confirmed = True
+            if setting.name in RECOVERY_SETTINGS:
+                desired = {int(a.value_key): value} if setting.name == "divert-keys" else value
+                confirmed = confirm_setting(device, setting, desired)
+            if result is not None and confirmed:
+                done.append(job)
         except Exception as ex:
             log.warning("%s: pending %s failed: %s", device.name, job.get("setting"), ex)
     remaining = [j for j in pending if j not in done]
@@ -219,22 +357,34 @@ def apply_pending(device):
         configuration.save()
     except Exception:
         pass
+    return len(done) == len(mine)
 
 
 def status_changed(device, alert=None, reason=None, refresh=False):
+    # Receiver callbacks run on listener threads. Own recovery state and writes
+    # on the GLib loop so repeated notifications cannot schedule two writers.
+    if device.kind is not None:
+        GLib.idle_add(device_changed, device, bool(device), bool(device.online))
+
+
+def device_changed(device, present, online):
     try:
-        if device.kind is None:  # a receiver
-            return
-        if not bool(device):  # unpaired / gone
-            _devices.pop(getattr(device, "path", None), None)
+        key = getattr(device, "path", None) or str(device.serial)
+        recovery = _recoveries.get(key)
+        if recovery and (recovery.device is not device or not online or not present):
+            cancel_recovery(key)
+        if not present:  # unpaired / gone
+            _devices.pop(key, None)
         else:
-            _devices[getattr(device, "path", None) or str(device.serial)] = device
-            if device.online:
-                GLib.idle_add(record_keys, device)
-                GLib.timeout_add(1500, lambda d=device: (apply_pending(d), False)[1])
+            _devices[key] = device
+            if online and key not in _recoveries:
+                recovery = DeviceRecovery(device)
+                _recoveries[key] = recovery
+                recovery.source = GLib.timeout_add(RECOVERY_DELAY_MS, recover_device, key, recovery)
         write_status()
     except Exception as ex:
         log.warning("status_changed failed: %s", ex)
+    return False
 
 
 def setting_changed(device, setting_class, vals):
