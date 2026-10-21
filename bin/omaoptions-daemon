@@ -75,6 +75,8 @@ except Exception:  # pragma: no cover
 # path -> Device (devices only, never receivers)
 _devices = {}
 _keys_recorded = set()
+_key_shapes = {}    # device key -> (key table length, reported keys) while discovery has holes
+_scan_complete = {} # device key -> True once Solaar's feature scan ran to the end
 _recoveries = {}
 _hidpp20 = Hidpp20()
 _last_online = {}   # serial/name -> time.time() when last seen online
@@ -87,6 +89,7 @@ class DeviceRecovery:
     source: int = 0
     delay: int = RECOVERY_DELAY_MS
     restored: set = field(default_factory=set)
+    pending_misses: set = field(default_factory=set)
     saved: dict | None = None
 
 
@@ -168,10 +171,12 @@ def _snapshot():
     return devices
 
 
-def write_status():
+def write_status(force=False):
     devices = _snapshot()
-    if not devices and os.path.exists(STATUS_PATH):
-        return  # keep the last known list until devices attach after a restart
+    # keep the last known list until devices attach after a restart, but do
+    # publish an explicit emptying (for example the last unpair) right away
+    if not devices and not force and os.path.exists(STATUS_PATH):
+        return
     _atomic_write(STATUS_PATH, {"at": time.time(), "devices": devices})
 
 
@@ -188,10 +193,15 @@ def record_keys(device):
                     or SupportedFeature.REPROG_CONTROLS_V2 in features
                     or SupportedFeature.REPROG_CONTROLS_V4 in features):
                 return False
+        holes = 0
         for i in range(len(ks) if ks is not None else 0):
             k = ks[i]
             if k is None:
-                return False
+                # A slot the firmware never reports stays None forever, so wait
+                # for the table shape to repeat across two attempts, then record
+                # the keys that exist.
+                holes += 1
+                continue
             flags = k.flags
             if flags is None or KeyFlag is None:
                 divertable = True
@@ -201,19 +211,44 @@ def record_keys(device):
                 except TypeError:
                     divertable = bool(int(getattr(flags, "value", flags)) & 0x20)
             keys.append({"name": str(k.key), "cid": int(k.key), "divertable": bool(divertable)})
+        if holes:
+            shape = (len(ks), len(keys))
+            if _key_shapes.get(key) != shape:
+                _key_shapes[key] = shape
+                return False
+            _key_shapes.pop(key, None)
     except Exception as ex:
         log.warning("could not read keys of %s: %s", device.name, ex)
         return False
     try:
         settings = device.settings
+        scanned = True
         # Solaar can latch feature discovery before keys are ready. Retry it
         # against the same list so missing settings are added without duplicates.
-        if device.protocol >= 2.0 and not settings_templates.check_feature_settings(device, settings):
-            return False
+        if device.protocol >= 2.0:
+            online = device.online
+            present = getattr(device, "present", None)
+            was_active = getattr(device, "_active", None)
+            scanned = settings_templates.check_feature_settings(device, settings)
+            # On an internal HID++ error Solaar guesses the device is gone and
+            # flips online/present, and the listener may never notify again, so
+            # that guess would end recovery. Undo it only when Solaar itself has
+            # not seen a real transition: changed() assigns _active together
+            # with online before any listener work, so an unchanged _active
+            # means the flip came from the guess, not from a disconnect or an
+            # unpair.
+            if (online and present and not device.present and bool(device)
+                    and was_active is not False and getattr(device, "_active", None) == was_active):
+                device.online = True
+                device.present = present
+            if not scanned:
+                return False
+            _scan_complete[key] = True
         settings = sorted({str(st.name) for st in settings})
         saved = device.persister or {}
         required = {name for name in RECOVERY_SETTINGS if saved.get(name) is not None
-                    and saved.get("_sensitive", {}).get(name) != SENSITIVITY_IGNORE}
+                    and saved.get("_sensitive", {}).get(name) != SENSITIVITY_IGNORE
+                    and (not scanned or name in settings)}
         if not required.issubset(settings) or not device.online:
             return False
     except Exception as ex:
@@ -241,7 +276,10 @@ def cancel_recovery(key):
     if recovery is not None:
         if recovery.source:
             GLib.source_remove(recovery.source)
-        _keys_recorded.discard(str(getattr(recovery.device, "serial", "") or recovery.device.name))
+        device_key = str(getattr(recovery.device, "serial", "") or recovery.device.name)
+        _keys_recorded.discard(device_key)
+        _key_shapes.pop(device_key, None)
+        _scan_complete.pop(device_key, None)
 
 
 def confirm_setting(device, setting, value):
@@ -288,6 +326,11 @@ def recover_device(key, recovery):
                     continue
                 setting = settings.get(name)
                 if setting is None:
+                    if _scan_complete.get(str(getattr(device, "serial", "") or device.name)):
+                        # The scan ran to the end and still found no setting, so
+                        # the device does not carry it and the saved value has
+                        # nothing to apply to.
+                        continue
                     complete = False
                     continue
                 # False is a successful write.
@@ -297,7 +340,7 @@ def recover_device(key, recovery):
                     complete = False
                 else:
                     recovery.restored.add(name)
-            if complete and apply_pending(device):
+            if complete and apply_pending(device, recovery.pending_misses):
                 log.info("%s: saved key settings restored", device.name)
                 return False
     except Exception as ex:
@@ -310,7 +353,7 @@ def recover_device(key, recovery):
     return False
 
 
-def apply_pending(device):
+def apply_pending(device, settled=None):
     """Settings `omaoptions apply` could not write because the device was
     offline are queued in pending.json; write them now that it is online."""
     try:
@@ -327,11 +370,12 @@ def apply_pending(device):
         log.warning("cannot apply pending settings: %s", ex)
         return False
     done = []
+    blocked = []
     for job in mine:
         try:
-            setting = next((s for s in device.settings if s.name == job["setting"]), None)
+            setting = next((s for s in device.settings if s.name == job.get("setting")), None)
             if setting is None:
-                log.warning("%s: no setting %s", device.name, job["setting"])
+                blocked.append(job)
                 continue
             vals = [str(v) for v in job.get("values", [])]
 
@@ -351,13 +395,34 @@ def apply_pending(device):
                 done.append(job)
         except Exception as ex:
             log.warning("%s: pending %s failed: %s", device.name, job.get("setting"), ex)
-    remaining = [j for j in pending if j not in done]
-    _atomic_write(PENDING_PATH, remaining)
+    missing = {j.get("setting") for j in blocked}
+    # A setting can still appear while Solaar latches feature discovery, so an
+    # absent setting gets one attempt before it stops holding the recovery open.
+    # Either way the job stays queued; a later reconnect applies it then.
+    hopeless = [j for j in blocked if j.get("setting") in (settled or ())]
+    if settled is not None:
+        settled.clear()
+        settled.update(missing)
+    if not done:
+        return len(hopeless) == len(mine)
+    try:
+        with open(PENDING_PATH) as f:
+            fresh = json.load(f)
+    except Exception:
+        # Never wipe a queue that was edited between our two reads; leave the
+        # file as it is and let the next attempt try again.
+        return False
+    # The queue file is shared with the panel CLI, so re-read it right before
+    # removing only what this pass applied; jobs queued meanwhile must survive,
+    # and a same-device job queued mid-round is applied on the next attempt.
+    _atomic_write(PENDING_PATH, [j for j in fresh if j not in done])
     try:
         configuration.save()
     except Exception:
         pass
-    return len(done) == len(mine)
+    leftover = [j for j in fresh if j.get("device", "").lower() == str(device.name).lower()
+                and j not in done and j not in hopeless]
+    return not leftover
 
 
 def status_changed(device, alert=None, reason=None, refresh=False):
@@ -369,11 +434,34 @@ def status_changed(device, alert=None, reason=None, refresh=False):
 
 def device_changed(device, present, online):
     try:
-        key = getattr(device, "path", None) or str(device.serial)
+        key = getattr(device, "path", None) or getattr(device, "serial", None)
+        removed = False
+        if key is None:
+            # Solaar ghosts an unpaired device as a namedtuple with neither
+            # serial nor path. The ghost keeps receiver and number, so match on
+            # that identity; without a receiver fall back to the name. Drop
+            # every entry the ghost maps to, recovery or not.
+            recv = getattr(device, "receiver", None)
+            number = getattr(device, "number", None)
+
+            def matches(other):
+                if recv is not None:
+                    return getattr(other, "receiver", None) is recv and getattr(other, "number", None) == number
+                return getattr(other, "name", None) == getattr(device, "name", None)
+
+            for stale in [k for k, known in _devices.items() if matches(known)]:
+                _devices.pop(stale, None)
+                removed = True
+            for stale in [k for k, recovery in _recoveries.items() if matches(recovery.device)]:
+                cancel_recovery(stale)
+                removed = True
+            write_status(removed)
+            return False
         recovery = _recoveries.get(key)
         if recovery and (recovery.device is not device or not online or not present):
             cancel_recovery(key)
         if not present:  # unpaired / gone
+            removed = key in _devices
             _devices.pop(key, None)
         else:
             _devices[key] = device
@@ -381,7 +469,7 @@ def device_changed(device, present, online):
                 recovery = DeviceRecovery(device)
                 _recoveries[key] = recovery
                 recovery.source = GLib.timeout_add(RECOVERY_DELAY_MS, recover_device, key, recovery)
-        write_status()
+        write_status(removed and not online)
     except Exception as ex:
         log.warning("status_changed failed: %s", ex)
     return False

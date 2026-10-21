@@ -73,6 +73,9 @@ class Device:
 
     def __init__(self):
         self.online = True
+        self.paired = True
+        self.present = True
+        self._active = True
         self.ready = False
         self.features = Features({Feature.FN_INVERSION, Feature.REPROG_CONTROLS_V4})
         self.persister = {"fn-swap": False, "divert-keys": {266: 1}}
@@ -90,6 +93,9 @@ class Device:
         self.fail_diversion_read = False
         self.ignore_fn_write = False
         self.fail_fn_read = False
+
+    def __bool__(self):
+        return self.paired
 
     @property
     def keys(self):
@@ -441,6 +447,236 @@ class RecoveryTests(unittest.TestCase):
         self.clock.advance(60000)
         self.assertIn(MappingFlag.DIVERTED, self.device.diversion_flags)
         self.assertEqual(json.loads(Path(self.daemon.PENDING_PATH).read_text()), [])
+
+    def test_permanent_key_hole_still_restores_saved_settings(self):
+        self.device.ready = True
+        self.device._keys = KeysArrayV4(self.device, 2)
+        query = self.device.feature_request
+
+        def hole_in_slot_1(feature, function=0, *data, **kwargs):
+            if feature == Feature.REPROG_CONTROLS_V4 and function == 0x10 and data and data[0] == 1:
+                return None
+            return query(feature, function, *data, **kwargs)
+
+        self.device.feature_request = hole_in_slot_1
+        self.notify()
+        self.clock.advance(2000)
+        self.assertFalse(Path(self.daemon.DEVICES_PATH).exists())
+        self.clock.advance(60000)
+        inventory = self.inventory()["devices"][0]
+        self.assertEqual(inventory["keys"], [{"name": "Screen Capture", "cid": 266, "divertable": True}])
+        # divert-keys cannot build on a table with a permanent hole, so only
+        # fn-swap has something to restore on it.
+        self.assertEqual(self.device.writes, [("fn-swap", False)])
+
+    def test_feature_scan_error_does_not_cancel_recovery(self):
+        self.device.ready = True
+        self.device.present = True
+        real_check = self.daemon.settings_templates.check_feature_settings
+        flaky = {"armed": True}
+
+        def flip_once(device, settings):
+            if flaky["armed"]:
+                flaky["armed"] = False
+                device.online = False
+                device.present = False
+                return False
+            return real_check(device, settings)
+
+        with patch.object(self.daemon.settings_templates, "check_feature_settings", flip_once):
+            self.notify()
+            self.clock.advance(60000)
+            self.assertEqual(self.device.writes, [("fn-swap", False), ("divert-keys", {266: 1})])
+        self.assertTrue(self.device.online)
+        self.assertTrue(self.device.present)
+
+    def test_unpair_ghost_cancels_recovery_and_keeps_reporting(self):
+        self.device.ready = True
+        self.notify()
+        self.clock.advance(60000)
+
+        class Ghost:
+            receiver = None
+            number = 1
+            name = "MX Keys Mini"
+            kind = "keyboard"
+            online = False
+            path = None
+
+            def __bool__(self):
+                return False
+
+        self.daemon.status_changed(Ghost())
+        self.clock.advance(0)
+        self.assertEqual(self.daemon._recoveries, {})
+        self.assertEqual(self.daemon._devices, {})
+        # unpairing the only device must publish the emptied list, not freeze
+        # the bar on the previous one
+        status = json.loads(Path(self.daemon.STATUS_PATH).read_text())
+        self.assertEqual(status["devices"], [])
+
+    def test_unapplicable_pending_job_stops_holding_recovery_open(self):
+        self.device.ready = True
+        pending = [{"device": "MX Keys Mini", "setting": "not-ready", "values": ["true"]}]
+        Path(self.daemon.PENDING_PATH).write_text(json.dumps(pending))
+        self.notify()
+        self.clock.advance(60000)
+        self.assertEqual(self.device.writes, [("fn-swap", False), ("divert-keys", {266: 1})])
+        self.assertEqual(json.loads(Path(self.daemon.PENDING_PATH).read_text()), pending)
+        self.clock.advance(600000)
+        self.assertEqual(self.device.writes, [("fn-swap", False), ("divert-keys", {266: 1})])
+        self.assertEqual(json.loads(Path(self.daemon.PENDING_PATH).read_text()), pending)
+
+    def test_pending_write_survives_a_parallel_queue_update(self):
+        self.device.ready = True
+        pending = [{"device": "MX Keys Mini", "setting": "fn-swap", "values": ["true"]}]
+        extra = {"device": "MX Mouse", "setting": "screen-capture", "values": ["false"]}
+        Path(self.daemon.PENDING_PATH).write_text(json.dumps(pending))
+        loads = {"pending": 0}
+        real_load = self.daemon.json.load
+
+        def inject_on_fresh_read(fp, *args, **kwargs):
+            data = real_load(fp, *args, **kwargs)
+            if getattr(fp, "name", None) == self.daemon.PENDING_PATH:
+                loads["pending"] += 1
+                if loads["pending"] == 2:
+                    return data + [extra]
+            return data
+
+        with patch.object(self.daemon.json, "load", inject_on_fresh_read):
+            self.notify()
+            self.clock.advance(60000)
+        final = json.loads(Path(self.daemon.PENDING_PATH).read_text())
+        self.assertEqual(final, [extra])
+
+    def test_real_disconnect_during_scan_is_not_overwritten(self):
+        self.device.ready = True
+
+        def listener_sees_the_drop(device, settings):
+            # Device.changed assigns online and _active together, before the
+            # listener does its register write and calls status_callback
+            device.online = False
+            device._active = False
+            device.present = False
+            return True
+
+        with patch.object(self.daemon.settings_templates, "check_feature_settings", listener_sees_the_drop):
+            self.notify()
+            self.clock.advance(60000)
+        self.assertFalse(self.device.online)
+        self.assertEqual(self.device.writes, [])
+        self.assertEqual(self.daemon._recoveries, {})
+        self.assertFalse(Path(self.daemon.DEVICES_PATH).exists())
+
+    def test_unpair_during_scan_is_not_overwritten(self):
+        self.device.ready = True
+
+        def listener_sees_unpair(device, settings):
+            device.online = False
+            device.paired = False
+            device.present = False
+            return True
+
+        with patch.object(self.daemon.settings_templates, "check_feature_settings", listener_sees_unpair):
+            self.notify()
+            self.clock.advance(60000)
+        self.assertFalse(self.device.online)
+        self.assertFalse(self.device.paired)
+        self.assertEqual(self.device.writes, [])
+        self.assertEqual(self.daemon._recoveries, {})
+
+    def test_stopped_direct_listener_keeps_last_status_snapshot(self):
+        self.notify()
+        self.device.paired = False
+        self.device.online = True
+        self.daemon.device_changed(self.device, False, True)
+        status = json.loads(Path(self.daemon.STATUS_PATH).read_text())
+        self.assertEqual([d["name"] for d in status["devices"]], ["MX Keys Mini"])
+
+    def test_unpair_ghost_matches_receiver_identity_not_name(self):
+        receiver = object()
+        other = Device()
+        other.serial = "test-keyboard-2"
+        other.path = None
+        other.receiver = receiver
+        other.number = 3
+        self.device.ready = True
+        self.notify()
+        self.daemon.status_changed(other)
+        self.clock.advance(0)
+        self.assertEqual(len(self.daemon._recoveries), 2)
+
+        class Ghost:
+            def __init__(self):
+                self.receiver = receiver
+                self.number = 3
+                self.name = "MX Keys Mini"
+                self.kind = "keyboard"
+                self.online = False
+                self.path = None
+
+            def __bool__(self):
+                return False
+
+        self.daemon.status_changed(Ghost())
+        self.clock.advance(0)
+        left = list(self.daemon._recoveries)
+        self.assertEqual(len(left), 1)
+        self.assertIs(self.daemon._recoveries[left[0]].device, self.device)
+        self.assertEqual(list(self.daemon._devices), ["/test/keyboard"])
+        status = json.loads(Path(self.daemon.STATUS_PATH).read_text())
+        self.assertEqual([d["name"] for d in status["devices"]], ["MX Keys Mini"])
+        self.clock.advance(60000)
+        self.assertEqual(self.device.writes, [("fn-swap", False), ("divert-keys", {266: 1})])
+        self.assertEqual(other.writes, [])
+
+    def test_same_device_job_queued_midround_does_not_strand(self):
+        self.device.ready = True
+        pending = [{"device": "MX Keys Mini", "setting": "fn-swap", "values": ["true"]}]
+        midround = {"device": "MX Keys Mini", "setting": "fn-swap", "values": ["false"]}
+        Path(self.daemon.PENDING_PATH).write_text(json.dumps(pending))
+        loads = {"pending": 0}
+        real_load = self.daemon.json.load
+
+        def queue_midround(fp, *args, **kwargs):
+            data = real_load(fp, *args, **kwargs)
+            if getattr(fp, "name", None) == self.daemon.PENDING_PATH:
+                loads["pending"] += 1
+                if loads["pending"] == 2:
+                    return data + [midround]
+            return data
+
+        with patch.object(self.daemon.json, "load", queue_midround):
+            self.notify()
+            self.clock.advance(60000)
+        self.assertEqual(json.loads(Path(self.daemon.PENDING_PATH).read_text()), [])
+        self.assertEqual(self.device.writes, [
+            ("fn-swap", False), ("divert-keys", {266: 1}), ("fn-swap", True), ("fn-swap", False)])
+
+    def test_fresh_queue_read_failure_leaves_the_queue_intact(self):
+        self.device.ready = True
+        pending = [{"device": "MX Keys Mini", "setting": "fn-swap", "values": ["true"]},
+                   {"device": "MX Mouse", "setting": "dpi", "values": ["800"]}]
+        Path(self.daemon.PENDING_PATH).write_text(json.dumps(pending))
+        loads = {"pending": 0}
+        real_load = self.daemon.json.load
+
+        def fail_fresh_read(fp, *args, **kwargs):
+            if getattr(fp, "name", None) == self.daemon.PENDING_PATH:
+                loads["pending"] += 1
+                if loads["pending"] == 2:
+                    raise OSError("queue file replaced mid-read")
+            return real_load(fp, *args, **kwargs)
+
+        with patch.object(self.daemon.json, "load", fail_fresh_read):
+            self.notify()
+            self.clock.advance(2000)
+        # a failed re-read must not rewrite the queue from the stale snapshot
+        self.assertEqual(json.loads(Path(self.daemon.PENDING_PATH).read_text()), pending)
+        self.clock.advance(60000)
+        # the same-device job applied on the retry, the other device's job kept
+        self.assertEqual(json.loads(Path(self.daemon.PENDING_PATH).read_text()), [pending[1]])
+        self.assertIn(("fn-swap", True), self.device.writes)
 
 
 if __name__ == "__main__":
