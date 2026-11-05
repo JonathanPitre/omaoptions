@@ -409,8 +409,15 @@ def merged_device(cfg, name, kind):
 # --------------------------------------------------------------------------
 
 
+def valid_device_name(name):
+    name = str(name or "")
+    return bool(name.strip()) and name.isprintable()
+
+
 def discovered_devices():
-    return [d for d in load_json(DEVICES_PATH, {}).get("devices", []) if d.get("name")]
+    records = load_json(DEVICES_PATH, {}).get("devices", [])
+    records = sorted(records, key=lambda d: (bool(d.get("keys") or d.get("settings")), bool(d.get("serial"))))
+    return list({d["name"]: d for d in records if valid_device_name(d.get("name"))}.values())
 
 
 def key_label(model, name, cid):
@@ -867,7 +874,7 @@ def probe_devices(with_keys=False):
         data = None
     if data is None:
         return None, (err.strip().splitlines()[-1] if err.strip() else f"probe exited {rc}")
-    return [d for d in data if "name" in d], ""
+    return [d for d in data if valid_device_name(d.get("name"))], ""
 
 
 def device_status():
@@ -889,6 +896,8 @@ def device_status():
     result = []
     known = {d["name"]: d for d in discovered_devices()}
     for d in devices:
+        if not valid_device_name(d.get("name")):
+            continue
         online = bool(d.get("online"))
         last = d.get("lastOnline")
         sleeping = (not online) and bool(last) and (time.time() - last) < 1800
@@ -922,7 +931,7 @@ def cmd_get(_args):
     views = [device_view(cfg, d) for d in discovered]
     # devices in the config that were never discovered: show them read-only
     for name, entry in (cfg.get("devices") or {}).items():
-        if not any(v["name"] == name for v in views):
+        if valid_device_name(name) and not any(v["name"] == name for v in views):
             views.append(device_view(cfg, {"name": name, "kind": entry.get("kind", ""), "keys": [], "settings": []}) | {"unseen": True})
     print(json.dumps({
         "config": cfg,
@@ -1012,8 +1021,8 @@ def cmd_discover(_args):
     if not devices or service_state()["active"] != "active":
         probed, err = probe_devices(with_keys=True)
         if probed:
-            devices = probed
-            save_json(DEVICES_PATH, {"at": time.time(), "devices": devices})
+            save_json(DEVICES_PATH, {"at": time.time(), "devices": probed})
+            devices = discovered_devices()
     print(json.dumps({"error": err or None, "devices": devices}, indent=2))
     return 0 if devices else 1
 

@@ -105,6 +105,8 @@ def _snapshot():
     devices = []
     for path, d in list(_devices.items()):
         try:
+            if not _valid_name(d.name):
+                continue
             key = str(getattr(d, "serial", "") or d.name)
             level, charging, full = _battery_fields(d)
             if d.online:
@@ -136,9 +138,16 @@ def write_status():
     _atomic_write(STATUS_PATH, {"at": time.time(), "devices": devices})
 
 
+def _valid_name(name):
+    name = str(name or "")
+    return bool(name.strip()) and name.isprintable()
+
+
 def record_keys(device):
-    key = str(getattr(device, "serial", "") or device.name)
-    if key in _keys_recorded or not device.online:
+    name = str(device.name or "")
+    serial = str(getattr(device, "serial", "") or "")
+    key = serial or name
+    if key in _keys_recorded or not device.online or not _valid_name(name):
         return
     keys = []
     try:
@@ -169,10 +178,11 @@ def record_keys(device):
         existing = json.load(open(DEVICES_PATH)).get("devices", [])
     except Exception:
         existing = []
-    existing = [e for e in existing if e.get("name") != str(device.name)]
-    existing.append({"name": str(device.name), "kind": str(device.kind or ""), "link": _link(device),
-                     "serial": str(getattr(device, "serial", "") or ""), "online": True,
-                     "keys": keys, "settings": settings})
+    if not keys and not settings and any(e.get("name") == name and (e.get("keys") or e.get("settings")) for e in existing):
+        return
+    existing = [e for e in existing if _valid_name(e.get("name")) and e.get("name") != name]
+    existing.append({"name": name, "kind": str(device.kind or ""), "link": _link(device),
+                     "serial": serial, "online": True, "keys": keys, "settings": settings})
     _atomic_write(DEVICES_PATH, {"at": time.time(), "devices": existing})
     log.info("%s: %d remappable keys recorded", device.name, sum(1 for k in keys if k["divertable"]))
 
