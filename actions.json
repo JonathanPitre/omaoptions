@@ -317,6 +317,21 @@
       ]
     },
     {
+      "id": "print-screen",
+      "label": "Print Screen",
+      "group": "Omarchy",
+      "kind": "key",
+      "keys": [
+        "KEY_SYSRQ"
+      ],
+      "keysyms": [
+        "Print"
+      ],
+      "scopes": [
+        "key"
+      ]
+    },
+    {
       "id": "capture-menu",
       "label": "Capture menu (screenshot / record)",
       "group": "Omarchy",
