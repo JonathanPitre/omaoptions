@@ -45,8 +45,8 @@ Panel {
   readonly property int refreshIntervalSec: Math.max(30, parseInt(String(setting("refreshIntervalSec", 120)), 10) || 120)
   readonly property bool showPercentage: String(setting("showPercentage", "On")).toLowerCase() !== "off"
   readonly property string barText: Model.barLabel(devices, showPercentage)
-  readonly property real openPanelIndicatorWidth: button.vertical ? 0 : button.glyphPaintedWidth
-  readonly property real openPanelIndicatorHeight: button.vertical ? button.glyphPaintedWidth : 0
+  readonly property real openPanelIndicatorWidth: button.vertical ? 0 : barMetrics.advanceWidth
+  readonly property real openPanelIndicatorHeight: button.vertical ? barMetrics.advanceWidth : 0
   readonly property bool anyConnected: Model.anyConnected(devices)
 
   readonly property var currentView: {
@@ -276,12 +276,15 @@ Panel {
     text: root.barText
   }
 
-  BarIconButton {
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
     text: root.barText
-    slotSize: Math.max(Style.bar.iconSlot, Math.ceil(barMetrics.advanceWidth) + Style.space(20))
+    fontSize: Style.bar.iconFont
+    centerFigures: false
+    fixedWidth: vertical ? -1 : Math.max(Style.bar.iconSlot, Math.ceil(barMetrics.advanceWidth) + Style.space(20))
+    fixedHeight: vertical ? Math.max(Style.bar.iconSlot, Math.ceil(barMetrics.advanceWidth) + Style.space(20)) : -1
     tooltipText: Model.summary(root.devices)
     opacity: root.anyConnected ? 1.0 : 0.6
     onPressed: function(b) {
